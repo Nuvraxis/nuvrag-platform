@@ -17,7 +17,7 @@ image:
   # Must match `github.repository` from the release workflow, lowercased — that workflow
   # pushes ghcr.io/<owner>/<repo>-api and friends. A mismatch here fails as ImagePullBackOff.
   repository: nuvraxis/nuvrag-platform
-  tag: "sha-4695061f4fe70437e71a59b89c1a6091073b17e4"
+  tag: "sha-64daed2666736d83f1d9e4368ace28a0d90b35e7"
   # GHCR packages are private until published. Create the pull secret first:
   #   kubectl create secret docker-registry ghcr -n rag \
   #     --docker-server=ghcr.io --docker-username=USER --docker-password=PAT
