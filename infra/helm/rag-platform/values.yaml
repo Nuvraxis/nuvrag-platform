@@ -1,0 +1,259 @@
+# Defaults describe an ordinary Kubernetes cluster pulling the published images from Docker
+# Hub, because that is what someone installing this chart from the registry has. This
+# project's own cluster is the special case and states its differences in
+# `infra/helm/values-config.yaml` — GHCR, the Tailscale operator, an in-cluster MinIO.
+#
+# Postgres and Redis are deliberately not part of this chart: both are managed services or
+# dedicated hosts in every environment this targets, and packaging them would invite someone
+# to run a database as a stateless Deployment.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: docker.io
+  # `<namespace>/<name>`; the chart appends `-api`, `-worker`, `-dashboard`, `-widget`.
+  repository: nuvraxis/rag-chatbot
+  # Overridden per release; `latest` in a Deployment makes rollbacks meaningless.
+  tag: ""
+  pullPolicy: Always
+  # None needed for the published images, which are public. Name a docker-registry Secret here
+  # when pulling from somewhere private — GHCR packages, for instance, stay private until you
+  # publish them, and want a PAT with `read:packages`.
+  pullSecrets: []
+  #  - name: ghcr
+
+# Non-secret configuration. Everything here lands in a ConfigMap and is safe to read.
+config:
+  environment: production
+  docsEnabled: false
+
+  # Leave blank and these follow `ingress.hosts` — with `ingress.tailnet` set, that resolves
+  # to the MagicDNS names the operator actually serves. Set them only to override.
+  dashboardBaseUrl: ""
+  dashboardCorsOrigins: ""
+  widgetCdnBaseUrl: ""
+  # Where a visitor's browser reaches the API. Served to the widget as config.json on the
+  # widget origin, so it stays out of the HTML tenants paste and can change without them.
+  apiPublicBaseUrl: ""
+
+  storage:
+    # local | s3 | azure_blob. `local` is a per-pod directory, so the worker cannot read what
+    # the API wrote unless it is an RWX volume — s3 (MinIO in-cluster is fine) is the sane
+    # default for more than one replica.
+    backend: s3
+    container: rag-documents
+    localRoot: /var/lib/rag/uploads
+    s3:
+      endpointUrl: http://minio.storage.svc.cluster.local:9000
+      region: us-east-1
+
+  # Provider choice is per chatbot and lives in the database — a tenant on Bedrock and a
+  # tenant on Ollama are served by the same pods. What is left here is process behaviour.
+  ai:
+    embeddingBatchSize: 100
+    requestTimeoutSeconds: 60
+    maxRetries: 3
+
+  ingestion:
+    # Empty disables malware scanning. Set it and the scan becomes mandatory: an unreachable
+    # scanner fails the ingestion job rather than letting the file through.
+    clamavHost: ""
+    clamavPort: 3310
+
+  observability:
+    tracingEnabled: false
+    otlpEndpoint: ""
+    logLevel: INFO
+
+# Credentials. Fill `values-secrets.yaml` (gitignored) and pass it with a second `--values`,
+# or create the Secret yourself with kubectl and set `create: false`.
+secrets:
+  existingSecret: rag-platform-secrets
+  create: true
+  values:
+    DB_CONNECTION_STRING: ""
+    DB_PRIVILEGED_DSN: ""
+    REDIS_URL: ""
+    SECURITY_JWT_SECRET: ""
+    AI_CREDENTIALS_ENCRYPTION_KEY: ""
+    STORAGE_S3_ACCESS_KEY_ID: ""
+    STORAGE_S3_SECRET_ACCESS_KEY: ""
+
+api:
+  replicaCount: 2
+  port: 8000
+  # `app` in api.Dockerfile. The kubelet refuses to start a container with `runAsNonRoot` when
+  # the image names its user instead of numbering it, so the UID is repeated here — keep it in
+  # step with the Dockerfile. The worker and the migration Job run this same image.
+  podSecurityContext:
+    runAsUser: 1001
+    runAsGroup: 1001
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { memory: 1Gi }
+  # k3s ships metrics-server, so an HPA works without installing anything. It stays off by
+  # default because a fixed pair of replicas is the right answer on a small cluster.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+  # A budget of minAvailable 1 blocks `kubectl drain` outright when there is one replica, so
+  # this is off until the deployment is genuinely spread across nodes.
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+worker:
+  replicaCount: 1
+  queues: ingestion,default
+  concurrency: 4
+  podSecurityContext:
+    runAsUser: 1001
+    runAsGroup: 1001
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 2Gi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 6
+    # Worker load is queue depth, not CPU. With KEDA installed, set `keda.enabled` instead —
+    # a CPU-based HPA scales down while a backlog is still draining.
+    targetCPUUtilizationPercentage: 75
+  keda:
+    enabled: false
+    listName: ingestion
+    listLength: "20"
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+
+# Celery beat: the scheduler that applies each chatbot's `retention_days`. Nothing else is on
+# the schedule, so disabling this costs retention and nothing else — but it costs it silently.
+# A tenant can still set a retention period in the dashboard, and with no beat running their
+# transcripts are kept forever while the UI says they are deleted. Leave it on, or tell your
+# tenants not to use the setting.
+#
+# There is no `replicaCount` here on purpose: see the comment in templates/beat.yaml.
+beat:
+  enabled: true
+  # UTC, not cluster-local. Off-peak by default because the sweep shares the worker pool with
+  # ingestion, and a tenant bulk-uploading at 03:30 would rather have the embeddings.
+  schedule:
+    hourUtc: 3
+    minuteUtc: 30
+  # `app`, created in api.Dockerfile — the same image and the same UID as the worker.
+  podSecurityContext:
+    runAsUser: 1001
+    runAsGroup: 1001
+  # A scheduler that sleeps until the next crontab hit. It needs almost nothing; the sweep
+  # itself runs on the worker.
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+
+dashboard:
+  replicaCount: 1
+  port: 3000
+  # `node`, from the node:24-alpine base.
+  podSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+widget:
+  replicaCount: 1
+  port: 8080
+  # `nginx`, from nginxinc/nginx-unprivileged.
+  podSecurityContext:
+    runAsUser: 101
+    runAsGroup: 101
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 128Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+# Runs as a pre-upgrade hook, so a rolling deploy never starts against an un-migrated
+# database and two replicas never race each other applying the same revision.
+migration:
+  enabled: true
+  backoffLimit: 2
+  activeDeadlineSeconds: 900
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 512Mi }
+
+ingress:
+  enabled: true
+  # Any ordinary controller — nginx, traefik, whatever the cluster runs — gets a single
+  # host-routed Ingress carrying all three origins. `tailscale` is the one special value: it
+  # switches the chart to the operator's shape, one Ingress per component, each becoming its
+  # own tailnet device named by `spec.tls`. The chart README covers that shape.
+  className: nginx
+  # Tailscale only: your tailnet's MagicDNS suffix, e.g. `tail1a2b3.ts.net`, which fills in the
+  # URLs the application advertises. Found under DNS in the admin console; ignored by every
+  # other class, where the hosts below are already fully qualified.
+  tailnet: ""
+  annotations: {}
+  # Tailscale only: a ProxyGroup for highly available ingress, a ProxyClass for proxy pod
+  # customisation. Blank leaves both to the operator's defaults.
+  proxyGroup: ""
+  proxyClass: ""
+  hosts:
+    # Placeholders — set all three to names you control. Under an ordinary controller these
+    # are the FQDNs the Host header must carry. Under `className: tailscale` they are short
+    # device names instead and the operator appends the tailnet suffix, so `rag` there becomes
+    # https://rag.<tailnet>.ts.net.
+    dashboard:
+      enabled: true
+      host: rag.example.com
+      # Tailscale only: funnel publishes to the public internet rather than only the tailnet.
+      # The dashboard is an admin surface and has no reason to be; the api and widget do, if
+      # tenant sites are going to embed the chat. Requires the `funnel` node attribute on
+      # `tag:k8s`.
+      funnel: false
+    api:
+      enabled: true
+      host: rag-api.example.com
+      funnel: false
+    widget:
+      enabled: true
+      host: rag-widget.example.com
+      funnel: false
+  tls:
+    # Ignored by the Tailscale operator, which provisions its own certificate. Under any other
+    # controller this is where the certificate Secret goes — cert-manager's, usually.
+    #
+    # Not commented out, however tempting: `ingress.yaml` reads `.tls.enabled` on every
+    # non-Tailscale path, and an absent key is a nil-pointer render failure rather than a
+    # default. Leaving it out broke `helm install` for everyone not on a tailnet.
+    enabled: false
+    secretName: rag-platform-tls
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

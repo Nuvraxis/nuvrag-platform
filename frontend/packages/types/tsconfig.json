@@ -1,0 +1,5 @@
+{
+  "extends": "@rag/config/tsconfig/base.json",
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules"]
+}

@@ -1,0 +1,12 @@
+apiVersion: v2
+name: rag-platform
+description: Multi-tenant RAG chatbot platform — API, ingestion worker, dashboard and widget origin
+type: application
+version: 0.0.1-rc.8
+appVersion: "0.0.1-rc.8"
+keywords:
+  - rag
+  - chatbot
+  - pgvector
+maintainers:
+  - name: Platform team

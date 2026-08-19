@@ -1,0 +1,21 @@
+{
+  "name": "@rag/types",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Request/response types generated from the FastAPI OpenAPI schema",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "openapi-typescript ./openapi.json --output ./src/schema.d.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@rag/config": "workspace:*",
+    "eslint": "^9.39.5",
+    "openapi-typescript": "^7.13.0",
+    "typescript": "^6.0.3"
+  }
+}

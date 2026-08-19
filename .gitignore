@@ -1,0 +1,52 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and local configuration
+.env
+.env.local
+*.pem
+# Filled-in Helm credentials, wherever they are copied to. values-secrets.example.yaml is
+# committed in its place, so the set of keys a release needs stays reviewable without the
+# values. values-config.yaml holds the non-secret half and is meant to be committed.
+values-secrets.yaml
+values-secrets.*.yaml
+!values-secrets.example.yaml
+
+# Local runtime artefacts
+var/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Widget build output (produced by frontend/apps/widget/build.mjs)
+frontend/apps/widget/dist/
+
+# Frontend workspace. `packages/types/{openapi.json,src/schema.d.ts}` are deliberately not
+# ignored: they are generated, but committing them keeps the frontend buildable without a
+# Python toolchain and makes a backend contract change visible in review.
+node_modules/
+.next/
+.turbo/
+next-env.d.ts
+*.tsbuildinfo
+
+# Local process logs from ad-hoc runs
+*.log
+
+devplans
+project_summary.md
+architecture.md
+
+# Claude Code's per-machine settings. The permission allowlist accumulates absolute
+# paths, local ports and throwaway dev credentials from whoever ran it, so it is
+# personal environment state rather than project configuration.
+.claude/

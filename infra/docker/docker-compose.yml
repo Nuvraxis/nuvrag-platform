@@ -1,0 +1,235 @@
+# Local development stack. Production runs the same images on Kubernetes with managed
+# Postgres, managed Redis and a CDN in front of widget-nginx.
+#
+#   docker compose -f infra/docker/docker-compose.yml up -d
+#
+# Paths are relative to the repository root, so run compose with -f from there.
+
+name: rag
+
+x-backend-env: &backend-env
+  ENVIRONMENT: local
+  DB_CONNECTION_STRING: postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db
+  REDIS_URL: redis://redis:6379/0
+  STORAGE_BACKEND: s3
+  STORAGE_CONTAINER: rag-documents
+  STORAGE_S3_ENDPOINT_URL: http://minio:9000
+  STORAGE_S3_ACCESS_KEY_ID: minioadmin
+  STORAGE_S3_SECRET_ACCESS_KEY: minioadmin
+  SECURITY_JWT_SECRET: ${SECURITY_JWT_SECRET:-local-development-secret-change-me}
+  SECURITY_DASHBOARD_CORS_ORIGINS: http://localhost:3000
+  WIDGET_CDN_BASE_URL: http://localhost:8080/widget
+  DASHBOARD_BASE_URL: http://localhost:3000
+  # Set to `clamav` together with `--profile security` to scan uploads before extraction.
+  INGESTION_CLAMAV_HOST: ${INGESTION_CLAMAV_HOST:-}
+  # Encrypts the provider credentials tenants enter in the dashboard. The fallback is a fixed
+  # local-only key: the stack has to come up with `docker compose up` and nothing else, and a
+  # value published in this file is no worse than the development database password above it.
+  # base64 of "local-development-key-change-me!"
+  AI_CREDENTIALS_ENCRYPTION_KEY: ${AI_CREDENTIALS_ENCRYPTION_KEY:-bG9jYWwtZGV2ZWxvcG1lbnQta2V5LWNoYW5nZS1tZSE=}
+  OTEL_LOG_FORMAT: console
+
+services:
+  postgres:
+  
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rag_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rag_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/rag-documents
+    restart: "no"
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    image: rag-api:latest
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Migrations run as their own step, exactly as they do in production (a pre-deploy Job)
+    # rather than implicitly on application startup.
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api.Dockerfile
+    image: rag-api:latest
+    environment: *backend-env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+    volumes:
+      - ../../app:/app/app:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health/live || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/worker.Dockerfile
+      args:
+        BASE_IMAGE: rag-api:latest
+    image: rag-worker:latest
+    environment: *backend-env
+    depends_on:
+      api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ../../app:/app/app:ro
+
+  # The scheduler. It enqueues the retention sweep and nothing else, so leaving it out costs
+  # only that — but a chatbot with `retention_days` set would then keep its conversations
+  # forever while the dashboard says otherwise. Runs the worker image: same `celery_app`,
+  # same schedule definition.
+  beat:
+    build:
+      context: ../..
+      dockerfile: infra/docker/worker.Dockerfile
+      args:
+        BASE_IMAGE: rag-api:latest
+    image: rag-worker:latest
+    environment: *backend-env
+    # `--schedule` into /tmp and no pidfile, matching the Helm deployment: a stale pidfile
+    # from an ungraceful stop would refuse to start the container again.
+    command:
+      - celery
+      - -A
+      - app.worker.celery_app.celery_app
+      - beat
+      - --loglevel=INFO
+      - --schedule=/tmp/celerybeat-schedule
+      - --pidfile=
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ../../app:/app/app:ro
+
+  # Opt-in: `docker compose --profile security up -d`. The image pulls a ~250 MB signature
+  # database on first start, which is not something every local run should pay for. Set
+  # INGESTION_CLAMAV_HOST=clamav alongside it to make the worker actually use it.
+  clamav:
+    image: clamav/clamav:1.4
+    profiles: ["security"]
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav-signatures:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 120s
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: infra/docker/dashboard.Dockerfile
+    image: rag-dashboard:latest
+    environment:
+      # Server-to-server, over the compose network: the browser never talks to the API
+      # directly, which is what lets the access token stay in an httpOnly cookie.
+      API_BASE_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  widget-nginx:
+    build:
+      context: ../..
+      dockerfile: infra/docker/widget-nginx/Dockerfile
+    image: rag-widget-nginx:latest
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  clamav-signatures:

@@ -1,0 +1,270 @@
+# Every commit and every pull request. Nothing here publishes anything — release.yml pushes
+# `main` to GHCR and publish.yaml pushes releases to Docker Hub.
+#
+# Postgres and Redis run as service containers because the integration suite skips itself when
+# they are unreachable, and a suite that silently skips is worse than no suite. The defaults in
+# `app/core/config.py` already point at localhost with these credentials, so no DSN is set here
+# — if that default changes, this file should start failing rather than quietly testing nothing.
+name: CI
+
+# Only for commits that touch something this workflow actually exercises. A README edit does
+# not need Postgres, pgvector and four image builds.
+#
+# The list is wider than "the source folders" on purpose, and each entry earns its place:
+# `alembic/` because the backend job runs `alembic upgrade head` and `alembic check`, so a
+# migration-only commit would otherwise merge untested; `tests/` because a test-only commit is
+# exactly when you want the suite run; the lockfiles because a dependency bump changes what
+# every job installs; `infra/docker/` because the image jobs build from it; and this file, so
+# a change to CI is validated by CI.
+#
+# Deliberately absent: `*.md`, `.env.example`, `infra/helm/` (nothing here lints the chart —
+# publish.yaml does), and the publishing workflows.
+#
+# NOTE, if any of these jobs is a *required* status check on a branch protection rule: a run
+# skipped by a path filter reports no status at all, rather than a passing one, so a docs-only
+# pull request would wait on a check that is never going to arrive. The fix cannot live in
+# this file — a filtered-out workflow runs none of its jobs — it needs a second workflow with
+# the same job names, triggered on the inverse `paths-ignore`, that does nothing and succeeds.
+# Nothing here is required today as far as this file can tell; add that companion before
+# making one required.
+# The two lists below are duplicated rather than shared through a YAML anchor: GitHub's
+# workflow parser does not support anchors, and a file it cannot parse is a file whose CI
+# silently stops running. Keep them in step.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'frontend/**'
+      - 'alembic/**'
+      - 'tests/**'
+      - 'infra/docker/**'
+      - 'alembic.ini'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.python-version'
+      - '.dockerignore'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'frontend/**'
+      - 'alembic/**'
+      - 'tests/**'
+      - 'infra/docker/**'
+      - 'alembic.ini'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.python-version'
+      - '.dockerignore'
+      - '.github/workflows/ci.yml'
+  # Unfiltered: a manual run is someone asking for it regardless of what changed.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Unlike the publishing workflows, a superseded CI run has produced nothing worth keeping.
+  cancel-in-progress: true
+
+env:
+  # Encrypts nothing that outlives the job; the application refuses to start without one, so
+  # a throwaway is what lets `alembic`, the OpenAPI export and the tests import settings.
+  AI_CREDENTIALS_ENCRYPTION_KEY: LcO6bLxHi4Bp9lRcErGMlYq8Rj0Ta7SnNu-eKrPMkJ0=
+  # 32+ bytes, otherwise PyJWT warns on every token the suite signs and buries the log.
+  SECURITY_JWT_SECRET: ci-only-not-a-real-secret-padded-to-32-bytes
+
+jobs:
+  backend:
+    name: Lint, migrate and test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        # pgvector rather than stock postgres: migration 0001 enables the extension, and the
+        # retrieval tests index real vectors.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rag_db
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rag_db"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check .
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: alembic upgrade head
+        run: uv run alembic upgrade head
+
+      # Catches a model edited without a migration. It runs against the database the previous
+      # step just migrated, so it compares metadata to real DDL rather than to itself.
+      - name: alembic check
+        run: uv run alembic check
+
+      - name: pytest
+        env:
+          # The suite's own default is 20s, which is fine against the stubs used here; the
+          # Ollama end-to-end class skips outright because no Ollama is reachable in CI.
+          AI_TEST_TIMEOUT_SECONDS: 60
+        run: uv run pytest tests/ -q
+
+  schema:
+    name: OpenAPI and generated types are current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv python install
+      - run: uv sync --locked
+
+      # There is no package.json at the repository root, so the action has to be told where
+      # the `packageManager` field it pins from actually lives.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      # Neither step needs a database: `create_app()` builds the schema without connecting.
+      - name: Re-export the OpenAPI schema
+        run: uv run python -m app.tools.export_openapi
+
+      - name: Regenerate the TypeScript types
+        run: pnpm --filter @rag/types generate
+        working-directory: frontend
+
+      # The point of the job: a renamed Pydantic field has to arrive with its regenerated
+      # types, or the dashboard compiles against a contract the API no longer serves.
+      - name: Fail if either is stale
+        run: |
+          if ! git diff --exit-code -- frontend/packages/types; then
+            echo "::error::The committed OpenAPI schema or generated types are stale. Run:" >&2
+            echo "  uv run python -m app.tools.export_openapi" >&2
+            echo "  pnpm --dir frontend --filter @rag/types generate" >&2
+            exit 1
+          fi
+
+  frontend:
+    name: Lint, typecheck and build the frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # There is no package.json at the repository root, so the action has to be told where
+      # the `packageManager` field it pins from actually lives.
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+        working-directory: frontend
+
+      - run: pnpm lint
+        working-directory: frontend
+      - run: pnpm typecheck
+        working-directory: frontend
+      - run: pnpm build
+        working-directory: frontend
+
+  images:
+    name: Build ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: dashboard
+            dockerfile: infra/docker/dashboard.Dockerfile
+          - component: widget
+            dockerfile: infra/docker/widget-nginx/Dockerfile
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Proves the Dockerfile still builds; publishing is another workflow's job.
+          push: false
+          cache-from: type=gha,scope=ci-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=ci-${{ matrix.component }}
+
+  api-images:
+    name: Build api and worker
+    runs-on: ubuntu-latest
+    services:
+      # A throwaway registry on the runner, and the reason for it:
+      #
+      # The worker's Dockerfile is `FROM ${BASE_IMAGE}`, so the api image must be resolvable
+      # *by the builder* when the worker builds. buildx's default `docker-container` driver
+      # runs the builder inside a container with its own image store and no view of the host
+      # daemon, so an image put there by `load: true` is invisible to it — buildx then reads a
+      # bare `rag-api:ci` as a Docker Hub reference and fails on
+      # `docker.io/library/rag-api:ci: pull access denied`.
+      #
+      # Pushing to a registry the builder can genuinely reach is the documented way round
+      # that, and unlike switching to the `docker` driver it keeps the GitHub Actions layer
+      # cache. Nothing leaves the runner: the registry dies with the job.
+      registry:
+        image: registry:2
+        ports: ["5000:5000"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Host networking, or the builder container cannot reach the service above on
+      # localhost:5000. BuildKit treats a localhost registry as insecure, so plain HTTP is
+      # fine here and no credentials are involved.
+      - uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: network=host
+
+      - name: api
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/api.Dockerfile
+          # Pushed rather than loaded: the whole point is that the next build can pull it back.
+          push: true
+          tags: localhost:5000/rag-api:ci
+          cache-from: type=gha,scope=ci-api
+          cache-to: type=gha,mode=max,scope=ci-api
+
+      - name: worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/worker.Dockerfile
+          build-args: |
+            BASE_IMAGE=localhost:5000/rag-api:ci
+          push: false

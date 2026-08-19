@@ -1,0 +1,123 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rag.fullname" . }}-widget
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: widget
+spec:
+  {{- if not .Values.widget.autoscaling.enabled }}
+  replicas: {{ .Values.widget.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rag.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: widget
+  template:
+    metadata:
+      labels:
+        {{- include "rag.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: widget
+      annotations:
+        # A subPath mount is a copy, not a live view, so a changed API address only reaches
+        # the pods if something rolls them.
+        checksum/config: {{ include (print $.Template.BasePath "/widget-config.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "rag.podSecurityContext" (list .Values.podSecurityContext .Values.widget.podSecurityContext) | nindent 8 }}
+      containers:
+        - name: widget
+          image: {{ include "rag.image" (list . "widget") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.widget.port }}
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          # nginx writes its pid and temp files under /tmp, which the unprivileged image
+          # already points at; nothing else needs to be writable, so this one container keeps
+          # a writable root whatever the chart-wide default becomes.
+          #
+          # Set on a copy rather than written as a second literal line after the shared
+          # block, which emitted the same key twice in one mapping — something Helm tolerates
+          # by keeping the last, while a post-renderer rejects it as invalid YAML. `deepCopy`
+          # keeps this out of the value every other component reads.
+          #
+          # `set` and not `merge`: merge is mergo-backed and treats `false` as an empty value,
+          # so a merged override is discarded and the chart-wide setting silently wins back.
+          {{- $sc := deepCopy .Values.containerSecurityContext }}
+          {{- $_ := set $sc "readOnlyRootFilesystem" false }}
+          securityContext:
+            {{- toYaml $sc | nindent 12 }}
+          resources:
+            {{- toYaml .Values.widget.resources | nindent 12 }}
+          volumeMounts:
+            # subPath so this lands *beside* the built bundle instead of replacing the
+            # directory and hiding loader.js along with it.
+            - name: widget-config
+              mountPath: /usr/share/nginx/html/widget/config.json
+              subPath: config.json
+              readOnly: true
+      volumes:
+        - name: widget-config
+          configMap:
+            name: {{ include "rag.fullname" . }}-widget-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rag.fullname" . }}-widget
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: widget
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  selector:
+    {{- include "rag.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: widget
+{{- if .Values.widget.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "rag.fullname" . }}-widget
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "rag.fullname" . }}-widget
+  minReplicas: {{ .Values.widget.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.widget.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.widget.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

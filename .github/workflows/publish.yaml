@@ -1,0 +1,386 @@
+# Public release: four images and the Helm chart, to Docker Hub.
+#
+# Triggered by *publishing* a GitHub release whose tag is semver — not by pushing a commit,
+# which release.yml handles into GHCR. The split is deliberate: GHCR carries every commit on
+# main for this cluster to deploy, Docker Hub carries the versions the outside world is meant
+# to pull.
+#
+# Requires, under Settings > Secrets and variables > Actions:
+#   secrets.DOCKERHUB_USERNAME  a Docker Hub login with push rights on the namespace
+#   secrets.DOCKERHUB_TOKEN     an access token for that account (not the password)
+#   vars.DOCKERHUB_NAMESPACE    optional; defaults to `nuvraxis`
+name: Publish
+
+on:
+  release:
+    types: [published]
+  # Re-run a publish that failed halfway without cutting a second release. The tag must
+  # already exist; nothing here creates one.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing semver tag to publish, e.g. v1.2.3"
+        required: true
+        type: string
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name || inputs.tag }}
+  # Never cancel a publish: a half-pushed release is worse than a slow one.
+  cancel-in-progress: false
+
+env:
+  REGISTRY: docker.io
+  CHART_DIR: infra/helm/rag-platform
+
+jobs:
+  prepare:
+    name: Resolve and check the version
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.v.outputs.ref }}
+      version: ${{ steps.v.outputs.version }}
+      minor: ${{ steps.v.outputs.minor }}
+      major: ${{ steps.v.outputs.major }}
+      latest: ${{ steps.v.outputs.latest }}
+      images: ${{ steps.v.outputs.images }}
+    steps:
+      - id: v
+        name: Parse the tag
+        env:
+          # A release publish carries the tag on the event; a manual run carries it as input.
+          RAW_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          # A pre-release must never move `latest`. `workflow_dispatch` reports neither, so a
+          # tag carrying a pre-release suffix is treated as one on its own evidence below.
+          IS_PRERELEASE: ${{ github.event.release.prerelease || false }}
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nuvraxis' }}
+        run: |
+          set -euo pipefail
+
+          # Semver with an optional leading `v` and an optional pre-release: 1.2.3, v1.2.3,
+          # v1.2.3-rc.1. Anything else is a mistake worth failing on rather than silently not
+          # publishing — someone pressed "publish release" and is entitled to know nothing
+          # came of it.
+          pattern='^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          if [[ ! "$RAW_TAG" =~ $pattern ]]; then
+            # Build metadata is valid semver but not a valid container tag: the registry
+            # charset is [A-Za-z0-9_.-] and `+` is not in it. Caught here with an explanation
+            # rather than as an opaque failure four jobs later, at the push.
+            if [[ "$RAW_TAG" == *+* ]]; then
+              echo "::error::'$RAW_TAG' carries semver build metadata; '+' cannot appear in a container tag. Release it as ${RAW_TAG%%+*} instead." >&2
+              exit 1
+            fi
+            echo "::error::'$RAW_TAG' is not a semver tag; expected something like v1.2.3." >&2
+            exit 1
+          fi
+
+          # Helm chart versions and OCI tags must not carry the leading `v`.
+          version="${RAW_TAG#v}"
+          core="${version%%-*}"; core="${core%%+*}"
+          major="${core%%.*}"
+          minor="${core%.*}"
+
+          # `latest` follows a stable release only. A pre-release suffix is decisive even when
+          # the GitHub checkbox was left unticked.
+          latest=true
+          if [[ "$IS_PRERELEASE" == "true" || "$version" == *-* ]]; then
+            latest=false
+          fi
+
+          {
+            echo "ref=$RAW_TAG"
+            echo "version=$version"
+            echo "major=$major"
+            echo "minor=$minor"
+            echo "latest=$latest"
+            echo "images=${NAMESPACE}/rag-chatbot"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Publishing $version (latest=$latest) to ${NAMESPACE}/rag-chatbot-*"
+
+  api:
+    name: Build and push api
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      # The digest alone crosses the job boundary, never a full image reference.
+      #
+      # This job references `secrets.DOCKERHUB_USERNAME`, so the runner registers that
+      # secret's value as a string to mask — and that value is also the Docker Hub namespace.
+      # A job output containing a masked value is redacted and **not sent** at all, so an
+      # output of `docker.io/<namespace>/rag-chatbot-api@sha256:...` arrives at the next job
+      # as an empty string. The worker then built with a blank `BASE_IMAGE` and failed on
+      # `base name (${BASE_IMAGE}) should not be blank`. A bare `sha256:` digest contains
+      # nothing secret, so it survives; the worker reassembles the reference from it.
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.images }}-api
+          # Written as `raw` rather than `semver` because the version is resolved once in
+          # `prepare` and shared, so a manual re-run behaves identically to a release event.
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.minor }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=${{ needs.prepare.outputs.major }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.latest == 'true' }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/api.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+  worker:
+    name: Build and push worker
+    needs: [prepare, api]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # An output that was dropped arrives as an empty string, not as an error, and the build
+      # then fails several steps later on `base name (${BASE_IMAGE}) should not be blank`.
+      # Checked here so the cause is named where it happened.
+      - name: Check the api digest arrived
+        env:
+          DIGEST: ${{ needs.api.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::the api job produced no digest. A job output containing a masked secret value is redacted and never sent, so nothing carrying the Docker Hub namespace may cross a job boundary." >&2
+            exit 1
+          fi
+          echo "worker builds FROM the api image at ${DIGEST}"
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.images }}-worker
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.minor }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=${{ needs.prepare.outputs.major }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.latest == 'true' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/worker.Dockerfile
+          # Reassembled here rather than passed whole: the namespace comes from `prepare`,
+          # which references no secrets and so is delivered intact, and the digest comes from
+          # `api`. Pinned by digest rather than tag — unambiguous even while `latest` is being
+          # moved beneath it.
+          build-args: |
+            BASE_IMAGE=${{ env.REGISTRY }}/${{ needs.prepare.outputs.images }}-api@${{ needs.api.outputs.digest }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  frontend-images:
+    name: Build and push ${{ matrix.component }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: dashboard
+            dockerfile: infra/docker/dashboard.Dockerfile
+          - component: widget
+            dockerfile: infra/docker/widget-nginx/Dockerfile
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ needs.prepare.outputs.images }}-${{ matrix.component }}
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.minor }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=${{ needs.prepare.outputs.major }},enable=${{ needs.prepare.outputs.latest == 'true' }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.latest == 'true' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  chart:
+    name: Package and push the Helm chart
+    # Last, and only once every image it will point at actually exists — a chart that
+    # resolves to an absent tag is an ImagePullBackOff someone else has to diagnose.
+    needs: [prepare, api, worker, frontend-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+      - uses: azure/setup-helm@v4
+
+      # Everything below works on a copy under `build/`, never on the checked-out chart.
+      #
+      # The committed chart already defaults to Docker Hub and to an ordinary ingress class,
+      # so for a release published under `nuvraxis` this changes nothing — it exists so a fork
+      # publishing under its own namespace gets a chart pointing at its own images, and so
+      # that whatever is rewritten can never leak back into the repository's chart. Packaging
+      # the working tree in place is how a publish-time edit quietly becomes a committed one.
+      - name: Stage a separate copy of the chart
+        id: stage
+        env:
+          IMAGES: ${{ needs.prepare.outputs.images }}
+        run: |
+          set -euo pipefail
+          staged=build/rag-platform
+          rm -rf build && mkdir -p build
+          cp -r "$CHART_DIR" "$staged"
+
+          values="${staged}/values.yaml"
+          sed -i 's|^  registry: .*$|  registry: docker.io|' "$values"
+          sed -i "s|^  repository: .*$|  repository: ${IMAGES}|" "$values"
+
+          # Assert rather than trust: a silently unmatched sed would publish a chart pointing
+          # at a registry the consumer cannot pull from.
+          grep -q '^  registry: docker.io$' "$values"
+          grep -q "^  repository: ${IMAGES}\$" "$values"
+
+          # The copy is the only thing that may differ. A dirty checkout here would mean the
+          # rewrite escaped the staging directory.
+          git diff --exit-code -- "$CHART_DIR"
+
+          echo "dir=$staged" >> "$GITHUB_OUTPUT"
+          echo "chart images -> docker.io/${IMAGES}-<component>"
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          STAGED: ${{ steps.stage.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # `--app-version` is what the chart's `rag.image` helper falls back to when
+          # `image.tag` is empty, so the published chart pins this exact release rather than
+          # tracking `latest`. That is what keeps `helm rollback` meaningful.
+          helm package "$STAGED" --version "$VERSION" --app-version "$VERSION" --destination dist
+          echo "file=dist/rag-platform-${VERSION}.tgz" >> "$GITHUB_OUTPUT"
+
+      # Proves the artifact about to be published actually resolves to the images this run
+      # pushed, rather than trusting that the rewrite above landed.
+      - name: Render the packaged chart as a smoke test
+        env:
+          IMAGES: ${{ needs.prepare.outputs.images }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHART_FILE: ${{ steps.package.outputs.file }}
+        run: |
+          set -euo pipefail
+          helm template rag "$CHART_FILE" > /tmp/rendered.yaml
+
+          for component in api worker dashboard widget; do
+            expected="docker.io/${IMAGES}-${component}:${VERSION}"
+            if ! grep -q "image: ${expected}$" /tmp/rendered.yaml; then
+              echo "::error::packaged chart does not resolve to ${expected}" >&2
+              grep -oE 'image: [^ ]+' /tmp/rendered.yaml | sort -u >&2 || true
+              exit 1
+            fi
+            echo "renders ${expected}"
+          done
+
+      # Both ingress shapes, because the default above only exercises one of them and the
+      # other is what this project's own cluster runs. A chart that renders for the publisher
+      # but not for whoever installs it is the failure this catches.
+      - name: Render both ingress shapes
+        env:
+          CHART_FILE: ${{ steps.package.outputs.file }}
+        run: |
+          set -euo pipefail
+          for class in nginx traefik tailscale; do
+            helm template rag "$CHART_FILE" --set ingress.className="$class" >/dev/null
+            echo "renders with ingress.className=$class"
+          done
+          # With TLS on, the non-Tailscale path also reads `tls.secretName`.
+          helm template rag "$CHART_FILE" \
+            --set ingress.className=nginx --set ingress.tls.enabled=true >/dev/null
+          echo "renders with TLS enabled"
+
+      - name: Push to Docker Hub as an OCI artifact
+        env:
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nuvraxis' }}
+          CHART_FILE: ${{ steps.package.outputs.file }}
+          # Read from the environment rather than interpolated into the command, so the token
+          # never becomes part of a process argument list.
+          HELM_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          HELM_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Docker Hub's OCI endpoint is registry-1.docker.io; `docker.io` is the client alias
+          # and helm does not resolve it.
+          printf '%s' "$HELM_TOKEN" | helm registry login registry-1.docker.io \
+            --username "$HELM_USER" --password-stdin
+          helm push "$CHART_FILE" "oci://registry-1.docker.io/${NAMESPACE}"
+          helm registry logout registry-1.docker.io || true
+
+      - name: Summary
+        env:
+          IMAGES: ${{ needs.prepare.outputs.images }}
+          NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || 'nuvraxis' }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          LATEST: ${{ needs.prepare.outputs.latest }}
+        run: |
+          {
+            echo "### Published \`${VERSION}\`"
+            echo
+            echo "Images (\`latest\` moved: **${LATEST}**):"
+            for component in api worker dashboard widget; do
+              echo "- \`docker.io/${IMAGES}-${component}:${VERSION}\`"
+            done
+            echo
+            echo "Chart:"
+            echo '```'
+            echo "helm install rag oci://registry-1.docker.io/${NAMESPACE}/rag-platform --version ${VERSION}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

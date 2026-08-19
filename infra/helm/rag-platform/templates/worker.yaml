@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rag.fullname" . }}-worker
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  {{- if not (or .Values.worker.autoscaling.enabled .Values.worker.keda.enabled) }}
+  replicas: {{ .Values.worker.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rag.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "rag.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      # Long enough for an in-flight document to finish embedding. Celery stops accepting
+      # new work on SIGTERM, so this is drain time, not a delay.
+      terminationGracePeriodSeconds: 120
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "rag.podSecurityContext" (list .Values.podSecurityContext .Values.worker.podSecurityContext) | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "rag.image" (list . "worker") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - celery
+            - -A
+            - app.worker.celery_app.celery_app
+            - worker
+            - --loglevel=INFO
+            - --queues={{ .Values.worker.queues }}
+            - --concurrency={{ .Values.worker.concurrency }}
+          {{- include "rag.backendEnv" . | nindent 10 }}
+          # `celery inspect ping` talks to this process over the broker, which is a truthful
+          # liveness signal: a worker that cannot reach Redis cannot do any work either.
+          #
+          # Run through `sh -c` because the node name has to be substituted at runtime, and
+          # nothing else here will do it. Kubernetes expands `$(VAR)` in `command` and `args`
+          # only — never inside a probe — so a bare `celery@$(HOSTNAME)` is sent literally,
+          # matches no node, and `inspect ping` exits 69. That failed every single check while
+          # the worker itself was healthy: three failures, then SIGTERM, then the same again
+          # on the replacement pod.
+          #
+          # `$(hostname)` rather than `$HOSTNAME`: Celery derives its node name from
+          # `socket.gethostname()`, and the shell variable is set by the container runtime
+          # rather than promised by Kubernetes.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - >-
+                  celery -A app.worker.celery_app.celery_app inspect ping
+                  --destination celery@$(hostname)
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            timeoutSeconds: 15
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if and .Values.worker.autoscaling.enabled (not .Values.worker.keda.enabled) }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "rag.fullname" . }}-worker
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "rag.fullname" . }}-worker
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.worker.keda.enabled }}
+---
+# Queue depth is the real signal here. Ingestion spends most of its time waiting on the
+# embedding API, so CPU stays low while a backlog builds — a CPU-driven HPA would scale down
+# exactly when the queue needs draining.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "rag.fullname" . }}-worker
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "rag.fullname" . }}-worker
+  minReplicaCount: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.worker.autoscaling.maxReplicas }}
+  triggers:
+    - type: redis
+      metadata:
+        listName: {{ .Values.worker.keda.listName | quote }}
+        listLength: {{ .Values.worker.keda.listLength | quote }}
+        addressFromEnv: REDIS_URL
+{{- end }}
+{{- if .Values.worker.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "rag.fullname" . }}-worker
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.worker.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "rag.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

@@ -1,0 +1,36 @@
+@import 'tailwindcss';
+@import '@rag/config/tailwind/theme.css';
+
+/* `@rag/ui` is symlinked in from the workspace, and Tailwind skips node_modules when it
+ * scans for class names. Without this its components would ship unstyled. */
+@source '../../../../packages/ui/src';
+
+@layer base {
+  body {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    @apply bg-accent text-accent-foreground;
+  }
+}
+
+/* Feedback that only matters when a Server Action submits without JavaScript. With scripts
+ * running the same message arrives as a toast, and showing both would be noise. `scripting`
+ * is a CSS media feature, so this needs no inline script and cannot trip the CSP. */
+.no-js-only {
+  display: none;
+}
+
+@media (scripting: none) {
+  .no-js-only {
+    display: revert;
+  }
+
+  /* The mirror image: an affordance that needs a script to work at all, such as a drop
+   * target, should not be advertised to a browser that cannot run one. */
+  .js-only {
+    display: none;
+  }
+}

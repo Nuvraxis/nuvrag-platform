@@ -1,0 +1,88 @@
+{{- if .Values.beat.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rag.fullname" . }}-beat
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beat
+spec:
+  # Deliberately not `.Values.beat.replicaCount`, and deliberately no autoscaler. Celery beat
+  # is a scheduler, not a worker: two of them means every scheduled task is enqueued twice,
+  # and the retention sweep's Redis lock would turn the duplicate into a wasted pass rather
+  # than saving it. One is the only correct number, so the chart does not offer another.
+  replicas: 1
+  strategy:
+    # `Recreate` for the same reason. A RollingUpdate would run the new pod alongside the old
+    # one for a few seconds, which is exactly the double-scheduling this is avoiding.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rag.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beat
+  template:
+    metadata:
+      labels:
+        {{- include "rag.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: beat
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "rag.podSecurityContext" (list .Values.podSecurityContext .Values.beat.podSecurityContext) | nindent 8 }}
+      containers:
+        - name: beat
+          # The worker image: beat runs the same `celery_app`, and the schedule is defined in
+          # it. A separate image would be a second thing to keep in step for no gain.
+          image: {{ include "rag.image" (list . "worker") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - celery
+            - -A
+            - app.worker.celery_app.celery_app
+            - beat
+            - --loglevel=INFO
+            # Beat keeps its last-run times in a shelve file, written to the working
+            # directory by default — which fails outright under `readOnlyRootFilesystem` and
+            # is the wrong place regardless. The emptyDir below is where it goes instead.
+            - --schedule=/tmp/celerybeat-schedule
+            # An empty value disables the pidfile. It exists to stop two beats sharing a
+            # directory, which cannot happen here, and a stale one left by an ungraceful
+            # kill would refuse to start the replacement pod.
+            - --pidfile=
+          {{- include "rag.backendEnv" . | nindent 10 }}
+          # No liveness probe. `celery inspect ping` is the worker's check and beat does not
+          # answer it — beat has no queue consumer — so the honest options were a probe that
+          # tests nothing or none at all. A crashed beat exits its process, which the kubelet
+          # restarts on its own.
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.beat.resources | nindent 12 }}
+          volumeMounts:
+            - name: schedule
+              mountPath: /tmp
+      volumes:
+        # Losing this on a restart is harmless: the schedule is a crontab, so beat computes
+        # the next run from the clock rather than from what it remembers. The file only stops
+        # a restart re-firing something already done in the same minute.
+        - name: schedule
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

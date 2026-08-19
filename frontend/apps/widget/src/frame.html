@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>Chat</title>
+    <link rel="stylesheet" href="__STYLE__" integrity="__STYLE_INTEGRITY__" crossorigin="anonymous" />
+  </head>
+  <body>
+    <button id="launcher" class="launcher" type="button" aria-label="Open chat">&#128172;</button>
+
+    <section class="panel" aria-live="polite">
+      <header class="header">
+        <h1 id="title">Ask a question</h1>
+        <button id="close" class="close" type="button" aria-label="Close chat">&times;</button>
+      </header>
+
+      <div id="log" class="log" role="log" aria-label="Conversation"></div>
+
+      <form id="contact" class="contact" hidden>
+        <h2 id="contact-title">Talk to a human</h2>
+        <label for="contact-email">Email address</label>
+        <input
+          id="contact-email"
+          name="email"
+          type="email"
+          autocomplete="email"
+          maxlength="320"
+          required
+        />
+        <!-- The honest reason, because there is no outbound mail: nobody is emailed
+             automatically, and a promise of one would be a promise we cannot keep. -->
+        <p class="hint">So our team can reach you if you're not still here when they reply.</p>
+
+        <label for="contact-name">Name <span class="optional">(optional)</span></label>
+        <input id="contact-name" name="name" type="text" autocomplete="name" maxlength="200" />
+
+        <label for="contact-message">Message <span class="optional">(optional)</span></label>
+        <textarea id="contact-message" name="message" rows="3" maxlength="4000"></textarea>
+
+        <div class="contact-actions">
+          <button id="contact-cancel" type="button" class="secondary">Back to chat</button>
+          <button id="contact-send" type="submit">Send</button>
+        </div>
+      </form>
+
+      <form id="composer" class="composer">
+        <textarea
+          id="input"
+          rows="1"
+          placeholder="Ask anything…"
+          aria-label="Your message"
+          maxlength="4000"
+          required
+        ></textarea>
+        <button id="send" type="submit">Send</button>
+      </form>
+
+      <footer class="footer">
+        <button id="human" type="button" class="human">Talk to a human</button>
+        <span>Answers are generated from this site's documents.</span>
+        <!-- Filled in from the bootstrap response, and hidden while empty so a tenant who
+             has set neither link gets the footer exactly as it was. -->
+        <span id="legal" class="legal" hidden></span>
+        <!-- `target`/`rel` here rather than only in the script, so the link behaves the same
+             if the bootstrap request never lands. The frame's sandbox carries
+             `allow-popups-to-escape-sandbox`, without which a new tab would inherit it. -->
+        <span class="brand"
+          >Powered by
+          <a id="brand" href="https://nuvraxis.com" target="_blank" rel="noopener noreferrer nofollow"
+            >Nuvraxis</a
+          ></span
+        >
+      </footer>
+    </section>
+
+    <script src="__SCRIPT__" integrity="__SCRIPT_INTEGRITY__" crossorigin="anonymous"></script>
+  </body>
+</html>

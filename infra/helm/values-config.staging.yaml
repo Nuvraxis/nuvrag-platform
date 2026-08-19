@@ -1,0 +1,29 @@
+# Staging overlay. Applied *after* values-config.yaml, so it only carries what differs —
+# the shared settings stay in one place rather than drifting between two near-copies:
+#
+#   helm upgrade --install rag-staging infra/helm/rag-platform \
+#     --namespace rag-staging --create-namespace --set image.tag=0.1.0 \
+#     --values infra/helm/values-config.yaml \
+#     --values infra/helm/values-config.staging.yaml \
+#     --values infra/helm/values-secrets.yaml
+#
+# A different release name matters: the tailnet device names and the Kubernetes object names
+# both derive from it, and a collision would have two releases fighting over one device.
+
+config:
+  environment: staging
+  docsEnabled: true
+  observability:
+    logLevel: DEBUG
+
+api:
+  replicaCount: 1
+
+ingress:
+  hosts:
+    dashboard:
+      host: rag-staging
+    api:
+      host: rag-staging-api
+    widget:
+      host: rag-staging-widget

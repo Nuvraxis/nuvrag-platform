@@ -1,0 +1,202 @@
+# Continuous builds of `main` into GHCR, which is what this cluster deploys from:
+# `infra/helm/values-config.yaml` pins `image.tag` to a `sha-<commit>` produced here. Cutting a
+# public release is a separate concern and lives in publish.yaml — that one targets Docker Hub
+# and is triggered by publishing a GitHub release, not by landing a commit.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Deliberately not cancelling: a superseded run has usually already pushed some of its four
+  # images, and the `sha-` tag for that commit is what someone may be about to deploy. Letting
+  # it finish costs a few minutes and avoids a half-published commit.
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  api:
+    name: Build and push api
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-api
+          # `sha-<full commit>` is the tag `values-config.yaml` pins, so it is the one that
+          # must not change shape. `edge` is a moving pointer at the head of main for anyone
+          # who just wants "whatever is current" — never for a Deployment.
+          tags: |
+            type=sha,format=long
+            type=raw,value=edge,enable={{is_default_branch}}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/api.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      # `github.repository` keeps the owner's capitalisation and a registry reference must be
+      # lowercase. `docker/metadata-action` handles that for the tags it generates; this one
+      # is hand-built, so it has to be folded here.
+      - id: image
+        run: echo "ref=${REGISTRY}/${IMAGE_PREFIX,,}-api@${DIGEST}" >> "$GITHUB_OUTPUT"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+  worker:
+    name: Build and push worker
+    # The worker image is the API image with a different command, so it cannot be built until
+    # that tag exists in the registry.
+    needs: api
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker
+          tags: |
+            type=sha,format=long
+            type=raw,value=edge,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/docker/worker.Dockerfile
+          # Pinned by the digest the api job just pushed rather than by tag: a manual run from
+          # a branch produces no semver tag at all, and the digest is unambiguous either way.
+          build-args: |
+            BASE_IMAGE=${{ needs.api.outputs.image }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  frontend-images:
+    name: Build and push ${{ matrix.component }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: dashboard
+            dockerfile: infra/docker/dashboard.Dockerfile
+          - component: widget
+            dockerfile: infra/docker/widget-nginx/Dockerfile
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.component }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=edge,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+
+  # Deployment is disabled: this workflow publishes images to GHCR and stops there. Deploy the
+  # chart yourself with `helm upgrade` (see infra/helm/rag-platform/README.md), or restore the
+  # job below once the AKS cluster and its secrets exist.
+  #
+  # It needs, in repository settings: the `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` /
+  # `AZURE_SUBSCRIPTION_ID` secrets for federated login, the `AKS_RESOURCE_GROUP` /
+  # `AKS_CLUSTER_NAME` / `K8S_NAMESPACE` variables, and a `production` environment. Add back
+  # the `environment` input under `workflow_dispatch` to target a different one by hand.
+  #
+  # deploy:
+  #   name: Deploy
+  #   needs: [api, worker, frontend-images]
+  #   runs-on: ubuntu-latest
+  #   # Gates on the environment's protection rules, so requiring an approval for production is
+  #   # a repository setting rather than logic buried in this file.
+  #   environment: production
+  #   permissions:
+  #     contents: read
+  #     id-token: write
+  #
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #     - uses: azure/setup-helm@v4
+  #
+  #     - uses: azure/login@v2
+  #       with:
+  #         client-id: ${{ secrets.AZURE_CLIENT_ID }}
+  #         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+  #         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  #
+  #     - uses: azure/aks-set-context@v4
+  #       with:
+  #         resource-group: ${{ vars.AKS_RESOURCE_GROUP }}
+  #         cluster-name: ${{ vars.AKS_CLUSTER_NAME }}
+  #
+  #     # Migrations run inside this command as a pre-upgrade hook, so `--wait` covers both:
+  #     # if the schema change fails, no pod rolls. This workflow builds commits rather than
+  #     # tags, so the deployed tag is the `sha-<commit>` the jobs above pushed — the same
+  #     # shape `values-config.yaml` pins by hand today.
+  #     - name: helm upgrade
+  #       run: |
+  #         helm upgrade --install rag infra/helm/rag-platform \
+  #           --namespace "${{ vars.K8S_NAMESPACE }}" --create-namespace \
+  #           --set image.registry="${REGISTRY}" \
+  #           --set image.repository="${IMAGE_PREFIX,,}" \
+  #           --set image.tag="sha-${GITHUB_SHA}" \
+  #           --values infra/helm/values-config.yaml \
+  #           --wait --timeout 10m
+  #
+  #     - name: Report what is running
+  #       if: always()
+  #       run: kubectl get pods -n "${{ vars.K8S_NAMESPACE }}" -o wide

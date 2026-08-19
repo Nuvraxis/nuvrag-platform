@@ -1,0 +1,10 @@
+{
+  "name": "@rag/widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Embeddable chat widget bundle served from the widget CDN origin",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  }
+}

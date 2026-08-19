@@ -1,0 +1,82 @@
+# The description and README shown on each Docker Hub repository page.
+#
+# Deliberately not part of publish.yaml: a description belongs to the repository, not to a
+# tag, so fixing a typo should not require cutting a release. It runs whenever the source
+# files land on main, and can be run by hand to populate a repository that has never had one.
+#
+# Credentials:
+#   secrets.DOCKERHUB_USERNAME      the Docker Hub login, as publish.yaml uses
+#   secrets.DOCKERHUB_README_TOKEN  a PAT with repository *admin* scope — see below
+#   secrets.DOCKERHUB_TOKEN         fallback, so this still runs where one token does both
+#   vars.DOCKERHUB_NAMESPACE        optional; defaults to `nuvraxis`
+#
+# A description is not written through the registry. It is a PATCH to the Docker Hub REST API
+# against the repository itself, which is a different permission from pushing a tag to it — so
+# a token that publishes images perfectly well can still be refused here:
+#
+#   Acquiring token        <- the credentials are fine
+#   Sending PATCH request
+#   Error: Forbidden       <- 403, not 401: authenticated, but not allowed
+#
+# 403 means scope, not a wrong password. Mint a PAT with `Read, Write, Delete` (shown as repo
+# admin in the newer scope picker) and put it in DOCKERHUB_README_TOKEN. It is a separate
+# secret on purpose: publish.yaml keeps the narrow push-only token, and the broader one is
+# only ever seen by this workflow, which touches no images.
+name: Docker Hub READMEs
+
+# Run by hand only.
+#
+# Docker Hub calls this field the repository *overview*, and its API refuses to set it with
+# the credentials available here — see the note above. Until that is resolved the overviews
+# are pasted into the Docker Hub UI from `infra/docker/hub/`, which stays the source of
+# truth. Triggering on push would just paint every commit red for something already done by
+# hand, so this waits to be asked.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: dockerhub-readme
+  cancel-in-progress: true
+
+jobs:
+  describe:
+    name: ${{ matrix.repo }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # Every repository is independent, so one bad description should not hide the rest.
+      fail-fast: false
+      matrix:
+        include:
+          - repo: rag-chatbot-api
+            file: infra/docker/hub/api.md
+            short: The HTTP API of a multi-tenant RAG chatbot platform
+          - repo: rag-chatbot-worker
+            file: infra/docker/hub/worker.md
+            short: Ingestion worker — extracts, chunks and embeds uploaded documents
+          - repo: rag-chatbot-dashboard
+            file: infra/docker/hub/dashboard.md
+            short: Admin dashboard — chatbots, documents, conversations, tickets and team
+          - repo: rag-chatbot-widget
+            file: infra/docker/hub/widget.md
+            short: Serves the embeddable chat widget bundle
+          - repo: rag-platform
+            file: infra/docker/hub/chart.md
+            short: Helm chart for the multi-tenant RAG chatbot platform
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # A missing file would otherwise be reported by the action as an unhelpful failure, and
+      # a renamed one would silently keep the old description on the page.
+      - name: Check the source file exists
+        run: test -s "${{ matrix.file }}"
+
+      - uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ vars.DOCKERHUB_NAMESPACE || 'nuvraxis' }}/${{ matrix.repo }}
+          readme-filepath: ${{ matrix.file }}
+          short-description: ${{ matrix.short }}

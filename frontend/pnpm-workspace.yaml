@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - packages/*
+
+# pnpm blocks install scripts unless a package is listed here. These three fetch or compile a
+# native binary and genuinely need theirs; everything else stays blocked.
+allowBuilds:
+  '@tailwindcss/oxide': true
+  sharp: true
+  unrs-resolver: true

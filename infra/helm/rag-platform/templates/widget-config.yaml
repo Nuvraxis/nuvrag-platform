@@ -1,0 +1,13 @@
+# Read by loader.js on every page load, so tenants never carry the API's address in their
+# HTML and it can move without anyone editing a page they pasted months ago. It is the browser
+# that fetches this, so the value is the public URL, not the in-cluster Service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rag.fullname" . }}-widget-config
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: widget
+data:
+  config.json: |
+    {{ dict "apiBase" (.Values.config.apiPublicBaseUrl | default (include "rag.publicUrl" (list . "api"))) | toJson }}

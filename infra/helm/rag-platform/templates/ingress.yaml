@@ -1,0 +1,96 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "rag.fullname" . }}
+{{- $components := list "api" "dashboard" "widget" }}
+{{- if eq .Values.ingress.className "tailscale" }}
+{{- /*
+The Tailscale operator gives every Ingress its own tailnet device and reads the MagicDNS name
+from `spec.tls[0].hosts[0]` rather than from a rule host, so the three origins have to be
+three Ingresses. A single Ingress with three host rules would match the Host header against
+names the tailnet never sends. Nothing here terminates TLS: the proxy gets its certificate
+from Tailscale, which is why `tls` carries no secretName.
+*/}}
+{{- range $component := $components }}
+{{- $conf := index $.Values.ingress.hosts $component }}
+{{- if $conf.enabled }}
+{{- $annotations := deepCopy (default dict $.Values.ingress.annotations) }}
+{{- if $conf.funnel }}{{- $_ := set $annotations "tailscale.com/funnel" "true" }}{{- end }}
+{{- with $.Values.ingress.proxyGroup }}{{- $_ := set $annotations "tailscale.com/proxy-group" . }}{{- end }}
+{{- with $.Values.ingress.proxyClass }}{{- $_ := set $annotations "tailscale.com/proxy-class" . }}{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-{{ $component }}
+  labels:
+    {{- include "rag.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: tailscale
+  tls:
+    - hosts:
+        - {{ $conf.host | quote }}
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-{{ $component }}
+                port:
+                  number: 80
+{{- end }}
+{{- end }}
+{{- else }}
+{{- /*
+Any other controller routes on the Host header, so one Ingress carries all three origins.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+  annotations:
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    # SSE streams must reach the browser token by token. Proxy buffering would hold the whole
+    # answer back and make every chat reply arrive at once.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls.enabled }}
+  tls:
+    - secretName: {{ .Values.ingress.tls.secretName }}
+      hosts:
+        {{- range $component := $components }}
+        {{- $conf := index $.Values.ingress.hosts $component }}
+        {{- if $conf.enabled }}
+        - {{ $conf.host }}
+        {{- end }}
+        {{- end }}
+  {{- end }}
+  rules:
+    {{- range $component := $components }}
+    {{- $conf := index $.Values.ingress.hosts $component }}
+    {{- if $conf.enabled }}
+    - host: {{ $conf.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-{{ $component }}
+                port:
+                  number: 80
+    {{- end }}
+    {{- end }}
+{{- end }}
+{{- end }}

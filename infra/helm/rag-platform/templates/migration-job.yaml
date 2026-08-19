@@ -1,0 +1,96 @@
+{{- if .Values.migration.enabled }}
+{{- $migrateName := printf "%s-migrate" (include "rag.fullname" .) }}
+{{- $secretName := ternary $migrateName .Values.secrets.existingSecret .Values.secrets.create }}
+# The Job below is a hook, so it runs before the release's own ConfigMap and Secret are
+# applied — on a first install those objects do not exist yet, and `envFrom` would fail with
+# `configmap not found`. These carry the same payload for the length of the migration and
+# then delete themselves: `hook-succeeded` is only honoured once every hook of the event has
+# finished, so the lower weight keeps them alive until the Job is done. A failed migration
+# leaves them behind on purpose, so the Job can be inspected with its environment intact.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $migrateName }}
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+data:
+  {{- include "rag.configData" . | nindent 2 }}
+{{- if .Values.secrets.create }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $migrateName }}
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  {{- include "rag.secretData" . | nindent 2 }}
+{{- end }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # The revision suffix gives each upgrade its own Job name, so a failed migration stays on
+  # the cluster to be read rather than being overwritten by the next attempt.
+  name: {{ $migrateName }}-{{ .Release.Revision }}
+  labels:
+    {{- include "rag.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Before anything is rolled: the API must never start against a schema it does not know.
+    # `hook-failed` is deliberately absent from the delete policy — a failed job is evidence.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migration.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "rag.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # The API image, so the API's UID.
+        {{- include "rag.podSecurityContext" (list .Values.podSecurityContext .Values.api.podSecurityContext) | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "rag.image" (list . "api") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: {{ $migrateName }}
+            - secretRef:
+                name: {{ $secretName }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.migration.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

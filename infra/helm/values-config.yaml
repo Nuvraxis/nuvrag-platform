@@ -1,0 +1,105 @@
+# Non-secret configuration for this cluster. Committed on purpose: this is the reviewable
+# record of how the release is set up, and nothing here is a credential.
+#
+#   helm upgrade --install rag infra/helm/rag-platform \
+#     --namespace rag --create-namespace --set image.tag=0.1.0 \
+#     --values infra/helm/values-config.yaml \
+#     --values infra/helm/values-secrets.yaml
+#
+# Credentials live in values-secrets.yaml, which is gitignored. Keep the two apart: the split
+# is what lets this file be read, diffed and reviewed by anyone.
+
+image:
+  # The chart defaults to Docker Hub, because that is what someone installing the published
+  # chart pulls from. This cluster deploys commits rather than releases, and those only exist
+  # in GHCR — so it says so here rather than relying on a default that is not aimed at it.
+  registry: ghcr.io
+  # Must match `github.repository` from the release workflow, lowercased — that workflow
+  # pushes ghcr.io/<owner>/<repo>-api and friends. A mismatch here fails as ImagePullBackOff.
+  repository: nuvraxis/nuvrag-platform
+  tag: "sha-4695061f4fe70437e71a59b89c1a6091073b17e4"
+  # GHCR packages are private until published. Create the pull secret first:
+  #   kubectl create secret docker-registry ghcr -n rag \
+  #     --docker-server=ghcr.io --docker-username=USER --docker-password=PAT
+  pullSecrets:
+    - name: ghcr
+  #  - name: ghcr
+
+config:
+  environment: production
+  docsEnabled: true
+
+  apiPublicBaseUrl: "https://nuvrag-api.nuvraxis.com"
+
+
+  # Left blank so they follow `ingress.hosts` below. Overriding them by hand is what produced
+  # a widget URL with no `/widget` path (nginx serves the bundle from there and 404s
+  # everything else) pointing at a device name the ingress had since been renamed away from.
+  dashboardBaseUrl: ""
+  dashboardCorsOrigins: ""
+  widgetCdnBaseUrl: ""
+
+  storage:
+    backend: s3
+    container: rag-documents
+    s3:
+      endpointUrl: http://10.43.104.199:9000
+      region: eu-central-1
+
+  # Providers and their credentials are chosen per chatbot in the dashboard, so nothing about
+  # Azure, Bedrock, Anthropic or Ollama belongs in this file. Only the retry and batching
+  # behaviour of the processes does.
+  ai:
+    embeddingBatchSize: 100
+    requestTimeoutSeconds: 60
+    maxRetries: 3
+
+  ingestion:
+    # Empty disables malware scanning. Set it and scanning becomes mandatory: a scanner that
+    # cannot be reached fails the ingestion job rather than letting the file through.
+    clamavHost: ""
+    clamavPort: 3310
+
+  observability:
+    tracingEnabled: false
+    otlpEndpoint: ""
+    logLevel: INFO
+
+ingress:
+  enabled: true
+  className: tailscale
+  # Your tailnet's MagicDNS suffix — admin console, DNS page.
+  tailnet: tail4fc230.ts.net
+  hosts:
+    # Short device names, not FQDNs; the operator appends the tailnet suffix.
+    dashboard:
+      enabled: true
+      host: app
+      # The dashboard is the admin surface and has no reason to be on the public internet.
+      funnel: false
+    # A widget embedded on a tenant's site runs in a visitor's browser, which is not on your
+    # tailnet — both of these need funnel: true before any public embed will work, plus
+    # "nodeAttrs": [{"target": ["tag:k8s"], "attr": ["funnel"]}] in the tailnet policy.
+    api:
+      enabled: true
+      host: api
+      funnel: false
+    widget:
+      enabled: true
+      host: app-widget
+      funnel: false
+
+# Sizing. Autoscalers and disruption budgets stay off until the workload is spread across
+# more than one node: a PDB of minAvailable 1 against a single replica blocks kubectl drain.
+api:
+  replicaCount: 2
+
+worker:
+  replicaCount: 2
+  concurrency: 4
+
+dashboard:
+  replicaCount: 1
+
+widget:
+  replicaCount: 1

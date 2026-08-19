@@ -1,0 +1,49 @@
+{{ .Chart.Name }} {{ .Chart.Version }} is installed as {{ .Release.Name }}.
+
+Schema migrations ran as a pre-upgrade hook before any pod rolled:
+  kubectl logs -n {{ .Release.Namespace }} job/{{ include "rag.fullname" . }}-migrate-{{ .Release.Revision }}
+
+{{ if not .Values.ingress.enabled -}}
+No ingress is enabled. Port-forward to reach the dashboard:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "rag.fullname" . }}-dashboard 3000:80
+{{- else if eq .Values.ingress.className "tailscale" -}}
+Reachable on your tailnet once the operator has provisioned each device and its certificate,
+which takes a minute on first install:
+{{ range $component := list "dashboard" "api" "widget" }}
+{{- $conf := index $.Values.ingress.hosts $component }}
+{{- if $conf.enabled }}
+  {{ printf "%-9s" $component }}  {{ include "rag.publicUrl" (list $ $component) }}{{ if $conf.funnel }}  (also public, via Funnel){{ end }}
+{{- end }}
+{{- end }}
+
+  kubectl get ingress -n {{ .Release.Namespace }}   # ADDRESS column shows the MagicDNS name
+{{- if not .Values.ingress.tailnet }}
+
+NOTE: `ingress.tailnet` is unset, so the URLs above and the ones the application advertises
+are missing your tailnet suffix. Set it to the MagicDNS name shown in the admin console.
+{{- end }}
+{{- else -}}
+Reachable at:
+{{- range $component := list "dashboard" "api" "widget" }}
+{{- $conf := index $.Values.ingress.hosts $component }}
+{{- if $conf.enabled }}
+  {{ printf "%-9s" $component }}  https://{{ $conf.host }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{ if not .Values.beat.enabled -}}
+WARNING: `beat.enabled` is false, so nothing applies a chatbot's retention period. The
+dashboard still offers the setting and will report that conversations are deleted after N
+days. They will not be. Either enable beat or tell your tenants to leave the field blank.
+{{- end }}
+{{ if and .Values.secrets.create (not .Values.secrets.values.SECURITY_JWT_SECRET) -}}
+WARNING: no credentials are set. Pass values-secrets.yaml with a second `--values`, or the
+API will start on its development JWT key and a localhost database.
+{{- end }}
+{{ if eq .Values.config.environment "production" -}}
+Check before taking traffic:
+  * the API's database role is NOT the table owner, or row-level security is inert
+  * DB_PRIVILEGED_DSN points at the owner, for migrations and pre-login lookups
+  * SECURITY_JWT_SECRET is a real random value
+{{- end }}
