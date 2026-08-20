@@ -397,6 +397,41 @@ widget's own default, dark-mode switching included, which is also what makes the
 attribute inside the frame, and the schema is checked both when it is saved and when it is
 served.
 
+### Opening the chat from your own JavaScript
+
+A site that would rather trigger the chat from its own "Need help?" button than from the
+launcher in the corner can drive the widget with `postMessage`:
+
+```js
+window.postMessage({ type: "rag-widget:open" }, "*");
+window.postMessage({ type: "rag-widget:close" }, "*");
+window.postMessage({ type: "rag-widget:toggle" }, "*");
+```
+
+The loader forwards these into the frame. It also announces itself once the frame is live, so
+a page that needs to command the widget during load has something to wait for:
+
+```js
+window.addEventListener("message", function (event) {
+  if (event.data && event.data.type === "rag-widget:ready") {
+    document.getElementById("help").onclick = function () {
+      window.postMessage({ type: "rag-widget:open" }, "*");
+    };
+  }
+});
+```
+
+Most pages will not need that. A command sent after `loader.js` has run but before the frame
+has finished loading is queued and applied when it is ready, so an ordinary click handler
+never has to think about timing. Only a command posted *before* `loader.js` itself executes is
+lost — there is no listener attached yet — and `rag-widget:ready` is the answer to that.
+
+**Only the embedding page can do this.** The loader accepts commands solely when
+`event.source === window`, and the frame accepts them solely from its own parent. Another
+iframe on the page gets nothing, including one that knows the message names and reaches
+through the DOM to address the widget frame directly. A paused or archived chatbot ignores all
+three, so a site cannot force open a bot whose owner has taken it down.
+
 ### Pausing a chatbot
 
 A chatbot is `active`, `paused` or `archived`. Only `active` serves anything: for the other

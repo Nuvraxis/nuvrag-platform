@@ -38,6 +38,36 @@
   var MOUNT_ID = "rag-chat-widget-root";
   if (document.getElementById(MOUNT_ID)) return;
 
+  /**
+   * Commands the host page may send, so a site can open the chat from its own button:
+   *
+   *   window.postMessage({ type: "rag-widget:open" }, "*");
+   *
+   * `event.source === window` is the entire access check, and it is enough: a message posted
+   * by this page carries this window as its source, while one from any other frame on the
+   * page carries that frame. A third-party iframe therefore cannot drive a widget it does not
+   * own. Nothing here reaches the API — these only open and close a panel — and the frame
+   * checks the sender again at its end.
+   *
+   * Commands that arrive before the frame is listening are held rather than dropped. This
+   * file boots asynchronously, so an app calling open() on DOMContentLoaded would otherwise
+   * race the manifest fetch and lose. The queue is deliberately tiny: it exists to cover the
+   * boot, not to replay a session's worth of clicks at whoever finally listens.
+   */
+  var HOST_COMMANDS = { "rag-widget:open": 1, "rag-widget:close": 1, "rag-widget:toggle": 1 };
+  var sendToFrame = null;
+  var queued = [];
+
+  function onHostMessage(event) {
+    if (event.source !== window) return;
+    var type = (event.data || {}).type;
+    if (!HOST_COMMANDS[type]) return;
+    if (sendToFrame) sendToFrame(type);
+    else if (queued.length < 4) queued.push(type);
+  }
+
+  window.addEventListener("message", onHostMessage);
+
   function boot(manifest, apiBase) {
     var frameUrl =
       base +
@@ -102,6 +132,12 @@
       // view, and a reload is what asks the API again.
       if (data.type === "rag-widget:disabled") {
         window.removeEventListener("message", onMessage);
+        // The host's commands go with it. Leaving that listener attached would let an app
+        // keep queueing opens against a widget that no longer exists, and the queue would
+        // never drain.
+        window.removeEventListener("message", onHostMessage);
+        sendToFrame = null;
+        queued.length = 0;
         if (host.parentNode) host.parentNode.removeChild(host);
         return;
       }
@@ -111,6 +147,19 @@
       // Sending it as data instead would let anyone embedding the widget claim any site.
       if (data.type === "rag-widget:hello") {
         frame.contentWindow.postMessage({ type: "rag-widget:site" }, frameOrigin);
+
+        // The hello is the earliest point a command can actually be delivered. Posting when
+        // the element was created would reach the about:blank document the browser puts in a
+        // fresh iframe, which discards it and never tells anyone.
+        sendToFrame = function (type) {
+          frame.contentWindow.postMessage({ type: type }, frameOrigin);
+        };
+        for (var i = 0; i < queued.length; i++) sendToFrame(queued[i]);
+        queued.length = 0;
+
+        // So an app can wait for the widget rather than guess at a timeout. Not a command, so
+        // the listener above ignores this echo rather than looping on it.
+        window.postMessage({ type: "rag-widget:ready" }, "*");
         return;
       }
 

@@ -53,6 +53,50 @@ anyone changing that snippet.
 The chat UI runs in a sandboxed iframe so the host page's CSS cannot reach it and it cannot
 reach the host page.
 
+## Opening the chat from the page
+
+A site can drive the widget from its own UI — a "Need help?" link in a footer, a button in a
+checkout — instead of the launcher in the corner. Post a message to your own window:
+
+```js
+window.postMessage({ type: "rag-widget:open" }, "*");
+window.postMessage({ type: "rag-widget:close" }, "*");
+window.postMessage({ type: "rag-widget:toggle" }, "*");
+```
+
+The payload is the entire message: an object carrying a `type` string, and nothing else. The
+loader ignores any message whose `type` it does not recognise, so sharing `window` with other
+libraries that use `postMessage` is safe.
+
+| Message | Direction | Meaning |
+|---|---|---|
+| `rag-widget:open` | page → widget | show the chat panel |
+| `rag-widget:close` | page → widget | collapse back to the launcher |
+| `rag-widget:toggle` | page → widget | flip whichever state it is in |
+| `rag-widget:ready` | widget → page | the frame is live and accepting the three above |
+
+`rag-widget:ready` is the one message that travels the other way, and you only need it if a
+command might be sent while the page is still loading:
+
+```js
+window.addEventListener("message", function (event) {
+  if (event.data && event.data.type === "rag-widget:ready") {
+    document.getElementById("help").onclick = function () {
+      window.postMessage({ type: "rag-widget:open" }, "*");
+    };
+  }
+});
+```
+
+An ordinary click handler does not need that wait. A command sent after `loader.js` has run but
+before the frame has finished loading is queued and applied once it is ready; only one sent
+before `loader.js` executes at all is lost, because nothing is listening yet.
+
+**Only the embedding page can do this.** The loader accepts commands solely when
+`event.source === window`, and the frame accepts them solely from its own parent — so another
+iframe on the page gets nothing, even one that knows the message names and addresses the widget
+frame directly. A paused or archived chatbot ignores all three.
+
 ## Serving it
 
 Everything is under the `/widget/` path — the root is not a site. Requests elsewhere get a 404
@@ -70,8 +114,8 @@ Put a CDN in front of it if customer sites will carry real traffic.
 - **Port:** 8080
 - **User:** non-root, UID/GID `101`
 - **Health:** `GET /healthz`
-- **Size:** about 17 KB gzipped in total — the loader a page includes plus the chat UI it
-  pulls in — with no third-party JavaScript at all
+- **Size:** about 20 KB gzipped in total — the loader a page includes, the frame document it
+  mounts, and that frame's script and stylesheet — with no third-party JavaScript at all
 - **Base:** `nginxinc/nginx-unprivileged:1.27-alpine`
 
 ## Licence and security

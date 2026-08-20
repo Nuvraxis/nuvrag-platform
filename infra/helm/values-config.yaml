@@ -29,7 +29,7 @@ config:
   environment: production
   docsEnabled: true
 
-  apiPublicBaseUrl: "https://nuvrag-api.nuvraxis.com"
+  apiPublicBaseUrl: "https://app-api.tail4fc230.ts.net"
 
 
   # Left blank so they follow `ingress.hosts` below. Overriding them by hand is what produced
@@ -61,9 +61,13 @@ config:
     clamavPort: 3310
 
   observability:
-    tracingEnabled: false
-    otlpEndpoint: ""
+    tracingEnabled: true
+    otlpEndpoint: "http://otel-collector-opentelemetry-collector.monitoring.svc.cluster.local:4317"
     logLevel: INFO
+    serviceName: rag-api-local
+    logFormat: json
+    metricsEnabled: true
+
 
 ingress:
   enabled: true
