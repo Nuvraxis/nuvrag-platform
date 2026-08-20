@@ -289,6 +289,35 @@
     if (event.key === "Escape") setOpen(false);
   });
 
+  /**
+   * The same three actions, driven by the page that embeds us — a site opening the chat from
+   * its own "Need help?" button instead of the launcher. The loader forwards these; see the
+   * note there for why only the host page can send them.
+   *
+   * `event.source !== parent` is the guard that matters here: a sibling frame that happens to
+   * know the message names is not the embedder and gets nothing. A disabled widget ignores
+   * all three, so a paused or archived chatbot cannot be forced open by a site that kept its
+   * old snippet.
+   *
+   * `ready()` before opening covers the case where the panel is asked for during bootstrap:
+   * the launcher is still transparent at that point, and without this it would stay invisible
+   * after the visitor closes the panel again.
+   */
+  window.addEventListener("message", function (event) {
+    if (event.source !== parent || disabled) return;
+    var type = (event.data || {}).type;
+
+    if (type === "rag-widget:open") {
+      ready();
+      setOpen(true);
+    } else if (type === "rag-widget:close") {
+      setOpen(false);
+    } else if (type === "rag-widget:toggle") {
+      ready();
+      setOpen(!els.body.classList.contains("open"));
+    }
+  });
+
   /* --------------------------------------------------------------- markdown -- */
 
   /**
