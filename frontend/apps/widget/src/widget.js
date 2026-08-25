@@ -96,6 +96,8 @@
   var lastQuestion = "";
   /** Set once a ticket exists, so the affordance stops offering to open a second one. */
   var ticketOpen = false;
+  /** Set once the contextual offer has been rendered — see `offerEscalation`. */
+  var escalationOffered = false;
 
   els.title.textContent = TITLE;
   els.brand.href = brandHref(TITLE);
@@ -586,9 +588,20 @@
    * That flag means zero chunks were retrieved — the same condition behind "I do not have
    * information about that in the available documents" — so this appears exactly where the
    * assistant has just admitted it cannot help.
+   *
+   * Once per conversation, though. Conversational turns — "hi", "thanks", "no, tell me
+   * more" — retrieve nothing either, so each is a miss and the offer used to re-render after
+   * every one of them. The signal is right; repeating it was not, and the footer's permanent
+   * control already covers everything after the first.
+   *
+   * Not persisted, deliberately: iteration 7 promotes a session id to durable storage only
+   * once a visitor asks to be contacted, and a UI dedupe flag does not earn a write on those
+   * terms. `restore` renders history through the bubble helpers and never calls this, so a
+   * replayed transcript neither shows an offer nor consumes the one this allows.
    */
   function offerEscalation() {
-    if (ticketOpen || els.body.classList.contains("contacting")) return;
+    if (escalationOffered || ticketOpen || els.body.classList.contains("contacting")) return;
+    escalationOffered = true;
 
     var wrap = document.createElement("div");
     wrap.className = "offer";
