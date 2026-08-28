@@ -3,7 +3,7 @@ from uuid import UUID
 from sqlalchemy import exists
 from sqlmodel import func, select
 
-from app.models import Ticket, TicketStatus
+from app.models import Conversation, Ticket, TicketStatus
 from app.repositories.base import BaseRepository
 
 
@@ -74,6 +74,24 @@ class TicketRepository(BaseRepository[Ticket]):
         """
         result = await self.session.execute(
             select(exists(select(Ticket.id).where(Ticket.conversation_id == conversation_id)))
+        )
+        return bool(result.scalar())
+
+    async def exists_for_session(self, chatbot_id: UUID, external_session_id: str) -> bool:
+        """The same question as `exists_for_conversation`, asked before there is a
+        conversation row to ask it about.
+
+        The chat path needs the answer *before* it has ensured a conversation, and ensuring
+        one early would leave an empty row behind whenever a turn failed before it wrote
+        anything. One statement: the unique index on `(chatbot_id, external_session_id)`
+        finds the conversation, `ix_ticket_conversation_id` answers for it.
+        """
+        conversations = select(Conversation.id).where(
+            Conversation.chatbot_id == chatbot_id,
+            Conversation.external_session_id == external_session_id,
+        )
+        result = await self.session.execute(
+            select(exists(select(Ticket.id).where(Ticket.conversation_id.in_(conversations))))
         )
         return bool(result.scalar())
 

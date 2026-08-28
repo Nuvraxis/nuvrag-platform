@@ -21,7 +21,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.core.config import settings
 from app.core.exceptions import ProviderNotConfiguredError, UpstreamServiceError
 from app.core.logging import get_logger
-from app.core.security import utcnow
+from app.core.security import session_log_id, utcnow
 from app.db.session import tenant_session
 from app.models import MemoryEntry, MemorySubjectType, MemoryType, Message, MessageRole
 from app.models.memory_entry import CONTENT_MAX_LENGTH
@@ -32,7 +32,6 @@ from app.repositories import (
     TicketRepository,
 )
 from app.services.ai import factory
-from app.services.rag import session_log_id
 from app.services.redis_client import held_lock
 
 logger = get_logger(__name__)

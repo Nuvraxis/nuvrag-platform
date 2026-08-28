@@ -1940,15 +1940,18 @@ class TestEmbeddingDimensions:
             return _StubEmbeddings(768, locked=768)
 
         monkeypatch.setattr("app.services.rag.factory.get_embedding_provider", _stub_for_query)
-        matches = await retrieve(
-            ChatContext(
-                org_id=uuid.UUID(org_id),
-                chatbot_id=uuid.UUID(chatbot["id"]),
-                system_prompt="",
-                generation_config={},
-            ),
-            "refund requests",
-        )
+        matches = (
+            await retrieve(
+                ChatContext(
+                    org_id=uuid.UUID(org_id),
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    system_prompt="",
+                    generation_config={},
+                ),
+                "refund requests",
+                external_session_id=uuid.uuid4().hex,
+            )
+        ).matches
         assert matches, "the chunk written into the 768 partition was not retrieved"
         assert "Refund requests" in matches[0].chunk.content
 
@@ -2174,15 +2177,18 @@ class TestOllamaEndToEnd:
         width = config.json()["embedding_dimension"]
         assert isinstance(width, int) and width > 0
 
-        matches = await retrieve(
-            ChatContext(
-                org_id=uuid.UUID(org_id),
-                chatbot_id=uuid.UUID(chatbot["id"]),
-                system_prompt="",
-                generation_config={},
-            ),
-            "how long do I have to ask for a refund?",
-        )
+        matches = (
+            await retrieve(
+                ChatContext(
+                    org_id=uuid.UUID(org_id),
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    system_prompt="",
+                    generation_config={},
+                ),
+                "how long do I have to ask for a refund?",
+                external_session_id=uuid.uuid4().hex,
+            )
+        ).matches
         assert matches, "a real embedding round trip produced no retrievable chunk"
         assert "Refund" in matches[0].chunk.content
 
@@ -2999,11 +3005,17 @@ def _statements(*pairs: tuple[str, str]) -> str:
     return json.dumps([{"content": content, "type": kind} for content, kind in pairs])
 
 
-async def _stream_chat(client, chatbot, monkeypatch, session_id: str, *, locked=None) -> dict:
-    """One widget chat turn against stub providers, returning the `done` payload."""
+async def _stream_chat(
+    client, chatbot, monkeypatch, session_id: str, *, locked=None, chat=None, question=None
+) -> dict:
+    """One widget chat turn against stub providers, returning the `done` payload.
+
+    Pass `chat` a `_RecordingChat` to keep the assembled prompt for inspection.
+    """
+    provider = chat or _StubChat()
 
     async def _chat(*_args, **_kwargs):
-        return _StubChat()
+        return provider
 
     async def _embeddings(*_args, **_kwargs):
         return _StubEmbeddings(768, locked=locked)
@@ -3016,7 +3028,10 @@ async def _stream_chat(client, chatbot, monkeypatch, session_id: str, *, locked=
         "POST",
         "/public/widget/chat",
         headers={"X-Chatbot-Key": chatbot["public_key"], "Origin": TENANT_ORIGIN},
-        json={"message": "Can someone call me back?", "session_id": session_id},
+        json={
+            "message": question or "Can someone call me back?",
+            "session_id": session_id,
+        },
     ) as response:
         assert response.status_code == 200
         name = None
@@ -3479,6 +3494,504 @@ class TestVisitorMemoryQueueing:
         assert done["message_id"]
 
 
+# ------------------------------------------------------- nuvrag_mem read path --
+
+
+async def _seeded_visitor(client, token, org_id, chatbot, monkeypatch, *notes: str):
+    """A visitor with a ticket and some notes already remembered about them."""
+    session_id, conversation_id = await _escalated(client, token, chatbot)
+    report, _ = await _remember(
+        monkeypatch,
+        org_id,
+        conversation_id,
+        _statements(*[(note, "preference") for note in notes]),
+    )
+    assert report.written == len(notes), report
+    return session_id, conversation_id
+
+
+def _system_prompt(chat: _RecordingChat) -> str:
+    assert chat.messages, "the chat provider was never called"
+    return chat.messages[0].content
+
+
+class TestVisitorMemoryReadPath:
+    """Retrieval at chat time. No model is asked anything to decide what to recall — it is the
+    same ANN search the documents use, on the same query vector."""
+
+    async def test_a_remembered_note_reaches_the_prompt(self, client, monkeypatch):
+        """The question repeats the note's wording on purpose: `_hash_embedding` is a
+        bag-of-words stub and cannot score a paraphrase, so an exact echo is how these tests
+        get a hit above the real 0.45 floor. Genuine semantic recall is covered by the Ollama
+        test below."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        chat = _RecordingChat("Noted.")
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            chat=chat,
+            question="Prefers email over the phone",
+        )
+
+        system = _system_prompt(chat)
+        assert "BEGIN VISITOR MEMORY" in system
+        assert "- (preference) Prefers email over the phone" in system
+
+    async def test_the_memory_block_is_fenced_untrusted_and_separate_from_the_documents(
+        self, client, monkeypatch
+    ):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        chat = _RecordingChat("Noted.")
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            chat=chat,
+            question="Prefers email over the phone",
+        )
+        system = _system_prompt(chat)
+
+        # Its own fence, not folded into the document context.
+        assert system.index("END CONTEXT") < system.index("BEGIN VISITOR MEMORY")
+        assert "untrusted" in system[system.index("BEGIN VISITOR MEMORY") :].lower()
+        # Every rule is stated before any retrieved text, whatever that text claims.
+        assert system.index("VISITOR MEMORY block holds") < system.index("BEGIN CONTEXT")
+        # A note cannot outrank the documents, and cannot be cited as one.
+        assert "the CONTEXT block is right" in system
+        assert "Never cite a note with a [n] marker" in system
+
+    async def test_notes_survive_a_deleted_conversation_but_stop_being_recalled(
+        self, client, monkeypatch
+    ):
+        """The read gate, against a subject that genuinely still has notes on file.
+
+        Deleting a conversation takes its ticket with it and leaves the memory behind — that
+        is what `source_conversation_id ON DELETE SET NULL` is for, so that a transcript
+        expiring is not quietly an erasure. The visitor therefore ends up in a real state the
+        gate has to answer for: rows on file, no ticket. Nothing is recalled until they
+        escalate again, which is the conservative direction — it can only fail to remember,
+        never remember someone it should not.
+        """
+        from app.db.session import tenant_session
+        from app.models import MemoryEntry
+        from app.services.conversation import delete_conversation
+        from app.services.nuvrag_mem import recall
+        from sqlmodel import select
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, conversation_id = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        async def _recall():
+            async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+                return await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    subject_id=session_id,
+                    embedding=_hash_embedding("Prefers email over the phone", 768),
+                    dimension=768,
+                )
+
+        assert len(await _recall()) == 1
+
+        await delete_conversation(
+            uuid.UUID(org_id), uuid.UUID(chatbot["id"]), uuid.UUID(conversation_id)
+        )
+
+        # The note outlived the transcript it was learned in, unattached.
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            rows = (
+                await session.execute(
+                    select(MemoryEntry.content, MemoryEntry.source_conversation_id).where(
+                        MemoryEntry.chatbot_id == uuid.UUID(chatbot["id"])
+                    )
+                )
+            ).all()
+        assert rows == [("Prefers email over the phone", None)]
+
+        # But the gate no longer opens for them.
+        assert await _recall() == []
+
+    async def test_a_visitor_with_nothing_remembered_yet_still_gets_an_answer(
+        self, client, monkeypatch
+    ):
+        """The empty-result case, mirroring the zero-documents fix from iteration 6: nothing
+        remembered is an empty list, not an error and not an empty fence."""
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _escalated(client, token, chatbot)
+
+        chat = _RecordingChat("Sure, I can help.")
+        done = await _stream_chat(client, chatbot, monkeypatch, session_id, locked=768, chat=chat)
+
+        assert done["message_id"]
+        system = _system_prompt(chat)
+        # No fence, and no rules about a block that is not there.
+        assert "VISITOR MEMORY" not in system
+        assert "BEGIN CONTEXT" in system
+
+    async def test_a_chatbot_with_no_locked_width_still_streams(self, client, monkeypatch):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _escalated(client, token, chatbot)
+
+        chat = _RecordingChat("I do not have that in the available documents.")
+        done = await _stream_chat(client, chatbot, monkeypatch, session_id, chat=chat)
+
+        assert done["can_escalate"] is True
+        assert "VISITOR MEMORY" not in _system_prompt(chat)
+
+    async def test_the_similarity_floor_excludes_an_unrelated_note(self, client, monkeypatch):
+        """Both directions with the real default floor: an exact echo is recalled, a note with
+        no words in common is not. An irrelevant 'fact about you' is worse than a missing one,
+        which is why this floor sits above the document one."""
+        from app.core.config import settings
+        from app.db.session import tenant_session
+        from app.services.nuvrag_mem import recall
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client,
+            token,
+            org_id,
+            chatbot,
+            monkeypatch,
+            "Prefers email over the phone",
+            "Runs the EU West region",
+        )
+        assert settings.nuvrag_mem.retrieval_min_similarity == 0.45
+
+        async def _recall(question: str):
+            async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+                return await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    subject_id=session_id,
+                    embedding=_hash_embedding(question, 768),
+                    dimension=768,
+                )
+
+        found = await _recall("Prefers email over the phone")
+        assert [m.entry.content for m in found] == ["Prefers email over the phone"]
+        assert await _recall("completely unrelated wording here") == []
+
+    async def test_top_k_bounds_how_much_reaches_the_prompt(self, client, monkeypatch):
+        from app.core.config import settings
+        from app.db.session import tenant_session
+        from app.services.nuvrag_mem import recall
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "alpha note", "bravo note", "charlie note"
+        )
+
+        # The floor is what the previous test covers; this one is about the ceiling.
+        monkeypatch.setattr(settings.nuvrag_mem, "retrieval_min_similarity", 0.0)
+        monkeypatch.setattr(settings.nuvrag_mem, "retrieval_top_k", 2)
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            found = await recall(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                subject_id=session_id,
+                embedding=_hash_embedding("alpha note", 768),
+                dimension=768,
+            )
+        assert len(found) == 2
+        # Closest first, so a ceiling drops the least relevant rather than an arbitrary one.
+        assert found[0].entry.content == "alpha note"
+        assert found[0].similarity >= found[1].similarity
+
+    async def test_notes_do_not_cross_between_a_tenants_own_chatbots(self, client, monkeypatch):
+        """Memory is scoped per chatbot, not per org. One visitor talks to a company's sales
+        bot and its support bot with the same session id, and what they told one is not what
+        the other knows — `chatbot_id` in the predicate is what holds that, not RLS, because
+        both bots belong to the same tenant.
+
+        Cross-*organisation* isolation is a different mechanism and is proven against a real
+        unprivileged role in `TestVisitorMemoryRowLevelSecurity`.
+        """
+        from app.db.session import tenant_session
+        from app.services.nuvrag_mem import recall
+
+        token, org_id = await _signup(client)
+        support = (await _create_chatbot(client, token, name="Support Bot"))["chatbot"]
+        sales = (await _create_chatbot(client, token, name="Sales Bot"))["chatbot"]
+        await _configure_ai(client, token, support["id"])
+        await _configure_ai(client, token, sales["id"])
+
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, support, monkeypatch, "Prefers email over the phone"
+        )
+        # The same visitor escalates on the other bot, so the ticket gate cannot be what is
+        # doing the work here.
+        await _open_ticket(client, sales["public_key"], session_id=session_id, message="Hello")
+
+        async def _recall(chatbot_id: str):
+            async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+                return await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot_id),
+                    subject_id=session_id,
+                    embedding=_hash_embedding("Prefers email over the phone", 768),
+                    dimension=768,
+                )
+
+        assert len(await _recall(support["id"])) == 1
+        assert await _recall(sales["id"]) == []
+
+    async def test_one_visitors_notes_are_not_another_visitors(self, client, monkeypatch):
+        """Same chatbot, same tenant, two people. `subject_id` is the only thing separating
+        them — neither RLS nor the chatbot filter says anything here."""
+        from app.db.session import tenant_session
+        from app.services.nuvrag_mem import recall
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        alice, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+        bob, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        async def _recall(subject_id: str):
+            async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+                return await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    subject_id=subject_id,
+                    embedding=_hash_embedding("Prefers email over the phone", 768),
+                    dimension=768,
+                )
+
+        # Identical wording, so only the subject can tell the two rows apart.
+        for subject in (alice, bob):
+            found = await _recall(subject)
+            assert len(found) == 1, f"{len(found)} notes for one visitor, expected 1"
+            assert found[0].entry.subject_id == subject
+
+
+class TestVisitorMemoryIsNotACitation:
+    """`sources` means 'the material this answer came from'. A note about the visitor is not
+    a document, and showing it as one would misstate where the answer came from."""
+
+    async def _events(self, client, chatbot, monkeypatch, session_id, question):
+        async def _chat(*_args, **_kwargs):
+            return _StubChat("Understood.")
+
+        async def _embeddings(*_args, **_kwargs):
+            return _StubEmbeddings(768, locked=768)
+
+        monkeypatch.setattr("app.services.rag.factory.get_chat_provider", _chat)
+        monkeypatch.setattr("app.services.rag.factory.get_embedding_provider", _embeddings)
+
+        events = {}
+        async with client.stream(
+            "POST",
+            "/public/widget/chat",
+            headers={"X-Chatbot-Key": chatbot["public_key"], "Origin": TENANT_ORIGIN},
+            json={"message": question, "session_id": session_id},
+        ) as response:
+            assert response.status_code == 200
+            name = None
+            async for line in response.aiter_lines():
+                if line.startswith("event:"):
+                    name = line[6:].strip()
+                elif line.startswith("data:") and name:
+                    events[name] = json.loads(line[5:].strip())
+        return events
+
+    async def test_a_recalled_note_is_absent_from_sources_and_leaves_escalation_alone(
+        self, client, monkeypatch
+    ):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        events = await self._events(
+            client, chatbot, monkeypatch, session_id, "Prefers email over the phone"
+        )
+
+        # The chatbot has no documents, so `sources` is empty even though a note was recalled.
+        assert events["sources"]["sources"] == []
+        # And the grounding-miss signal still describes documents, not memory.
+        assert events["done"]["can_escalate"] is True
+
+
+async def _age_memory(org_id: str, chatbot_id: str, *, days: int) -> None:
+    """Backdate every note for a chatbot.
+
+    Retrieval only refreshes a note that has gone stale — see `TOUCH_STALENESS` — so a note
+    written a moment ago is deliberately left alone, and a test about refreshing has to work
+    with one that is actually old.
+    """
+    from app.db.session import tenant_session
+    from sqlalchemy import text as sql_text
+
+    async with tenant_session(uuid.UUID(org_id)) as session:
+        await session.execute(
+            sql_text(
+                "UPDATE memory_entry SET last_referenced_at = now() - "
+                "make_interval(days => :days) WHERE chatbot_id = :id"
+            ),
+            {"days": days, "id": uuid.UUID(chatbot_id)},
+        )
+
+
+async def _referenced_at(org_id: str, chatbot_id: str) -> dict:
+    from app.db.session import tenant_session
+    from app.models import MemoryEntry
+    from sqlmodel import select
+
+    async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+        result = await session.execute(
+            select(MemoryEntry.content, MemoryEntry.last_referenced_at).where(
+                MemoryEntry.chatbot_id == uuid.UUID(chatbot_id)
+            )
+        )
+        return dict(result.all())
+
+
+class TestVisitorMemoryStaysAlive:
+    """`last_referenced_at` is what the sweep ages on, so a note the assistant is still using
+    must not quietly reach its retention window."""
+
+    async def test_recalling_a_note_moves_its_last_referenced_at(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+        await _age_memory(org_id, chatbot["id"], days=20)
+
+        before = await _referenced_at(org_id, chatbot["id"])
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            question="Prefers email over the phone",
+        )
+        after = await _referenced_at(org_id, chatbot["id"])
+
+        assert after["Prefers email over the phone"] > before["Prefers email over the phone"]
+
+    async def test_a_turn_that_recalled_nothing_leaves_it_alone(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+        await _age_memory(org_id, chatbot["id"], days=20)
+
+        before = await _referenced_at(org_id, chatbot["id"])
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            question="something with no words in common",
+        )
+
+        assert await _referenced_at(org_id, chatbot["id"]) == before
+
+    async def test_only_the_notes_actually_recalled_are_kept_alive(self, client, monkeypatch):
+        """A turn refreshes what it used, not everything the visitor has ever said. Otherwise
+        one active note would hold a visitor's whole history out of the sweep forever."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client,
+            token,
+            org_id,
+            chatbot,
+            monkeypatch,
+            "Prefers email over the phone",
+            "Runs the EU West region",
+        )
+        await _age_memory(org_id, chatbot["id"], days=20)
+
+        before = await _referenced_at(org_id, chatbot["id"])
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            question="Prefers email over the phone",
+        )
+        after = await _referenced_at(org_id, chatbot["id"])
+
+        assert after["Prefers email over the phone"] > before["Prefers email over the phone"]
+        assert after["Runs the EU West region"] == before["Runs the EU West region"]
+
+    async def test_a_note_refreshed_moments_ago_is_not_rewritten(self, client, monkeypatch):
+        """Bumping the timestamp is an HNSW re-insert, not a cheap field update, so a chatty
+        visitor must not rewrite their working set on every question. Accuracy to the hour is
+        far finer than the days the sweep measures in."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+        await _age_memory(org_id, chatbot["id"], days=20)
+
+        async def _turn():
+            await _stream_chat(
+                client,
+                chatbot,
+                monkeypatch,
+                session_id,
+                locked=768,
+                question="Prefers email over the phone",
+            )
+
+        await _turn()
+        refreshed = await _referenced_at(org_id, chatbot["id"])
+        await _turn()
+
+        # The first turn refreshed it; the second found it fresh and wrote nothing.
+        assert await _referenced_at(org_id, chatbot["id"]) == refreshed
+
+
 @pytest.mark.skipif(
     _OLLAMA is None,
     reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
@@ -3555,3 +4068,59 @@ class TestVisitorMemoryAgainstOllama:
             f"memory_entry_p{width}" if width in (768, 1024, 1536) else "memory_entry_pdefault"
         )
         assert [table for _, table in placements] == [expected]
+
+    async def test_a_paraphrase_recalls_the_note_and_an_unrelated_question_does_not(self, client):
+        """Real semantic recall, which the bag-of-words stub cannot express.
+
+        The thresholds here are measured rather than assumed. Against nomic-embed-text the
+        note below scores 0.54 for contact-related paraphrases and 0.37 for a password reset,
+        with the default 0.45 floor sitting between them — which is the whole reason memory's
+        floor is higher than document retrieval's 0.25. The margin on the low side is not
+        large, which is why it is a setting.
+        """
+        from app.db.session import tenant_session
+        from app.services.ai import factory
+        from app.services.nuvrag_mem import extract_visitor_memory, recall
+
+        chat_model, embedding_model = _OLLAMA
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        configured = await _configure_ai(
+            client,
+            token,
+            chatbot["id"],
+            chat_model=chat_model,
+            embedding_model=embedding_model,
+        )
+        width = configured["embedding_dimension"]
+
+        session_id, conversation_id = await _escalated(
+            client,
+            token,
+            chatbot,
+            said="Please always email me. I never want to be phoned about anything.",
+        )
+        report = await extract_visitor_memory(uuid.UUID(org_id), uuid.UUID(conversation_id))
+        if report.written == 0:
+            pytest.skip(f"{chat_model} recorded nothing to recall")
+
+        embedder = await factory.get_embedding_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+
+        async def _recall(question: str):
+            vector = (await embedder.embed_batch([question]))[0]
+            async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+                return await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    subject_id=session_id,
+                    embedding=vector,
+                    dimension=width,
+                )
+
+        assert await _recall("What is the best way to get in touch with you?"), (
+            "a paraphrase of what the visitor said did not recall it"
+        )
+        assert await _recall("How do I reset a forgotten password?") == [], (
+            "an unrelated question recalled a note, which is the failure mode the floor exists "
+            "to prevent"
+        )

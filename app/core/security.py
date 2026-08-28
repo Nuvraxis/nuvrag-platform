@@ -101,3 +101,23 @@ def hash_api_key(key: str) -> str:
 
 def verify_api_key(key: str, hashed: str) -> bool:
     return hmac.compare_digest(hash_api_key(key), hashed)
+
+
+# How much of a session digest reaches a log line. Enough to correlate one visitor's turns
+# with each other; far too little to reconstruct the value it came from.
+_SESSION_LOG_ID_CHARS = 12
+
+
+def session_log_id(external_session_id: str) -> str:
+    """A correlator for logs, never the session id itself.
+
+    Since iteration 7 the session id also replays a conversation's transcript, which makes it
+    a bearer capability rather than a label — and a capability does not belong in a log line
+    that ships to an aggregator and outlives the session by months. A truncated digest
+    correlates the turns of one conversation exactly as well and grants nothing.
+
+    Lives here, beside the hash it is built from, rather than in whichever service happened to
+    need it first: two of them do now, and it was the import back into one of those that made
+    the memory module and the chat path circular.
+    """
+    return hash_api_key(external_session_id)[:_SESSION_LOG_ID_CHARS]
