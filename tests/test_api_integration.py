@@ -3577,21 +3577,24 @@ class TestVisitorMemoryReadPath:
         assert "the CONTEXT block is right" in system
         assert "Never cite a note with a [n] marker" in system
 
-    async def test_notes_survive_a_deleted_conversation_but_stop_being_recalled(
+    async def test_notes_survive_a_swept_conversation_but_stop_being_recalled(
         self, client, monkeypatch
     ):
         """The read gate, against a subject that genuinely still has notes on file.
 
-        Deleting a conversation takes its ticket with it and leaves the memory behind — that
-        is what `source_conversation_id ON DELETE SET NULL` is for, so that a transcript
-        expiring is not quietly an erasure. The visitor therefore ends up in a real state the
-        gate has to answer for: rows on file, no ticket. Nothing is recalled until they
-        escalate again, which is the conservative direction — it can only fail to remember,
-        never remember someone it should not.
+        The two retentions are separate on purpose, so a transcript can age out while the
+        notes learned from it are kept — that is what `source_conversation_id ON DELETE SET
+        NULL` is for. The visitor is then in a real state the gate has to answer for: notes on
+        file, and no ticket, because the ticket cascaded with the conversation. Nothing is
+        recalled until they escalate again, which is the conservative direction — this can
+        only fail to remember, never remember someone it should not.
+
+        A conversation deleted *on request* is different and takes the notes with it; see
+        `TestVisitorMemoryErasure`. Only the schedule leaves them behind.
         """
         from app.db.session import tenant_session
         from app.models import MemoryEntry
-        from app.services.conversation import delete_conversation
+        from app.services.conversation import purge_expired_conversations
         from app.services.nuvrag_mem import recall
         from sqlmodel import select
 
@@ -3614,9 +3617,21 @@ class TestVisitorMemoryReadPath:
 
         assert len(await _recall()) == 1
 
-        await delete_conversation(
-            uuid.UUID(org_id), uuid.UUID(chatbot["id"]), uuid.UUID(conversation_id)
+        # Resolve, age and sweep the transcript, leaving the notes to their own window.
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        target = next(item for item in listed if item["conversation_id"] == conversation_id)
+        await client.patch(
+            f"/api/v1/tickets/{target['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "resolved"},
         )
+        await _age_conversation(org_id, conversation_id, days=45)
+        await _set_retention(client, token, chatbot["id"], 30)
+        await purge_expired_conversations()
+
+        assert conversation_id not in await _conversation_ids(client, token, chatbot["id"])
 
         # The note outlived the transcript it was learned in, unattached.
         async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
@@ -4339,6 +4354,327 @@ class TestTicketMemoryPanel:
             headers={"Authorization": f"Bearer {token_b}"},
         )
         assert response.status_code == 404, response.text
+
+
+# ----------------------------------------------------- nuvrag_mem erasure --
+
+
+async def _age_memory_reference(org_id: str, chatbot_id: str, *, days: int) -> None:
+    """Backdate every note's last use, which is what the memory sweep ages on."""
+    from app.db.session import tenant_session
+    from sqlalchemy import text as sql_text
+
+    async with tenant_session(uuid.UUID(org_id)) as session:
+        await session.execute(
+            sql_text(
+                "UPDATE memory_entry SET last_referenced_at = now() - "
+                "make_interval(days => :days) WHERE chatbot_id = :id"
+            ),
+            {"days": days, "id": uuid.UUID(chatbot_id)},
+        )
+
+
+class TestVisitorMemoryErasure:
+    """The primitive that honours an erasure request, and what it deliberately ignores."""
+
+    async def test_an_admin_can_forget_a_visitor(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        created = await _open_ticket(
+            client, chatbot["public_key"], session_id=uuid.uuid4().hex, message="Someone else"
+        )
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        await _remember(
+            monkeypatch,
+            org_id,
+            created["conversation_id"],
+            _statements(("Runs the EU West region", "fact")),
+        )
+        assert len(await _memories(org_id, chatbot["id"])) == 2
+
+        ticket = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        target = next(t for t in ticket if t["conversation_id"] == conversation_id)
+
+        response = await client.delete(
+            f"/api/v1/tickets/{target['id']}/memory",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 204, response.text
+
+        # Only that visitor's notes went; the other person on the same chatbot is untouched.
+        assert [content for content, _, _ in await _memories(org_id, chatbot["id"])] == [
+            "Runs the EU West region"
+        ]
+
+    async def test_erasure_does_not_step_over_an_open_ticket(self, client, monkeypatch):
+        """The asymmetry with the sweep. An open ticket pins a visitor's notes against the
+        schedule, because losing them mid-investigation would be the worse failure — but a
+        request to forget somebody has to be honourable whatever else is open."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+
+        listed = (
+            await client.get(
+                "/api/v1/tickets?status=open", headers={"Authorization": f"Bearer {token}"}
+            )
+        ).json()["items"]
+        target = next(t for t in listed if t["conversation_id"] == conversation_id)
+        assert target["status"] == "open"
+
+        response = await client.delete(
+            f"/api/v1/tickets/{target['id']}/memory",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 204, response.text
+        assert await _memories(org_id, chatbot["id"]) == []
+
+    async def test_a_member_cannot_forget_a_visitor(self, client, monkeypatch):
+        """Admin or above, matching every other destructive action here."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch, org_id, conversation_id, _statements(("Prefers email", "preference"))
+        )
+
+        invitation = await _invite(client, token, _address(), role="member")
+        member = await _join(client, invitation)
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+
+        response = await client.delete(
+            f"/api/v1/tickets/{listed[0]['id']}/memory",
+            headers={"Authorization": f"Bearer {member['tokens']['access_token']}"},
+        )
+        assert response.status_code == 403, response.text
+        assert len(await _memories(org_id, chatbot["id"])) == 1
+
+    async def test_another_organisation_cannot_forget_your_visitor(self, client, monkeypatch):
+        token_a, org_a = await _signup(client)
+        chatbot_a = (await _create_chatbot(client, token_a))["chatbot"]
+        await _configure_ai(client, token_a, chatbot_a["id"])
+        _, conversation_a = await _escalated(client, token_a, chatbot_a)
+        await _remember(
+            monkeypatch, org_a, conversation_a, _statements(("Prefers email", "preference"))
+        )
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token_a}"})
+        ).json()["items"]
+
+        token_b, _ = await _signup(client)
+        response = await client.delete(
+            f"/api/v1/tickets/{listed[0]['id']}/memory",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert response.status_code == 404, response.text
+        assert len(await _memories(org_a, chatbot_a["id"])) == 1
+
+    async def test_deleting_a_conversation_also_forgets_its_visitor(self, client, monkeypatch):
+        """Erasing a transcript on request must not leave a standing summary of the person who
+        wrote it. The schema keeps the two lifecycles separate — `source_conversation_id` is
+        SET NULL — and this is the one caller that deliberately joins them."""
+        from app.services.conversation import delete_conversation
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        assert len(await _memories(org_id, chatbot["id"])) == 1
+
+        await delete_conversation(
+            uuid.UUID(org_id), uuid.UUID(chatbot["id"]), uuid.UUID(conversation_id)
+        )
+        assert await _memories(org_id, chatbot["id"]) == []
+
+
+class TestVisitorMemorySweep:
+    """The scheduled half. Ages on last use, steps over open work, and never shares the
+    conversation sweep's lock."""
+
+    async def test_an_unused_note_is_purged_and_a_recent_one_is_kept(self, client, monkeypatch):
+        from app.services.nuvrag_mem import purge_expired_memory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        # Resolved, so age is what decides its fate rather than the open-ticket pin.
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        await client.patch(
+            f"/api/v1/tickets/{listed[0]['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "resolved"},
+        )
+
+        await _age_memory_reference(org_id, chatbot["id"], days=45)
+        report = await purge_expired_memory()
+
+        assert report.entries_deleted >= 1
+        assert report.incomplete == []
+        assert await _memories(org_id, chatbot["id"]) == []
+
+    async def test_a_note_still_in_use_is_kept(self, client, monkeypatch):
+        """Ages on `last_referenced_at`, not `created_at`: a note the assistant is still
+        returning has not gone stale just because it was learned a while ago."""
+        from app.services.nuvrag_mem import purge_expired_memory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        await client.patch(
+            f"/api/v1/tickets/{listed[0]['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "resolved"},
+        )
+
+        # Learned long ago, used today.
+        from app.db.session import tenant_session
+        from sqlalchemy import text as sql_text
+
+        async with tenant_session(uuid.UUID(org_id)) as session:
+            await session.execute(
+                sql_text(
+                    "UPDATE memory_entry SET created_at = now() - interval '400 days', "
+                    "last_referenced_at = now() WHERE chatbot_id = :id"
+                ),
+                {"id": uuid.UUID(chatbot["id"])},
+            )
+
+        await purge_expired_memory()
+        assert len(await _memories(org_id, chatbot["id"])) == 1
+
+    async def test_an_unresolved_ticket_pins_a_visitors_notes(self, client, monkeypatch):
+        """Extends the rule conversations already have. Losing what is known about someone
+        while staff are working their open ticket would be the worse failure."""
+        from app.services.nuvrag_mem import purge_expired_memory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch,
+            org_id,
+            conversation_id,
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        await _age_memory_reference(org_id, chatbot["id"], days=90)
+
+        await purge_expired_memory()
+        assert len(await _memories(org_id, chatbot["id"])) == 1, "an open ticket did not pin"
+
+        # Resolving releases the pin, and the same note ages out on the next sweep.
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        await client.patch(
+            f"/api/v1/tickets/{listed[0]['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "resolved"},
+        )
+
+        await purge_expired_memory()
+        assert await _memories(org_id, chatbot["id"]) == []
+
+    async def test_a_chatbot_keeping_memory_forever_is_left_alone(self, client, monkeypatch):
+        from app.services.nuvrag_mem import purge_expired_memory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _set_memory_retention(client, token, chatbot["id"], None)
+        _, conversation_id = await _escalated(client, token, chatbot)
+        await _remember(
+            monkeypatch, org_id, conversation_id, _statements(("Prefers email", "preference"))
+        )
+        listed = (
+            await client.get("/api/v1/tickets", headers={"Authorization": f"Bearer {token}"})
+        ).json()["items"]
+        await client.patch(
+            f"/api/v1/tickets/{listed[0]['id']}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"status": "resolved"},
+        )
+        await _age_memory_reference(org_id, chatbot["id"], days=4000)
+
+        await purge_expired_memory()
+        assert len(await _memories(org_id, chatbot["id"])) == 1
+
+    async def test_a_second_sweep_alongside_the_first_is_a_no_op(self, client):
+        """Beat can fire again while a sweep is still running."""
+        from app.core.config import settings
+        from app.services.nuvrag_mem import purge_expired_memory
+        from app.services.redis_client import held_lock
+
+        config = settings.nuvrag_mem
+        async with held_lock(config.lock_key, ttl_seconds=config.lock_ttl_seconds) as held:
+            assert held
+            report = await purge_expired_memory()
+
+        assert report.skipped_locked is True
+        assert report.entries_deleted == 0
+
+    async def test_the_two_sweeps_never_share_a_lock(self, client):
+        """One key for both would let whichever ran first silently skip the other, and the
+        failure would look exactly like a sweep with nothing to do."""
+        from app.core.config import settings
+
+        assert settings.retention.lock_key != settings.nuvrag_mem.lock_key
+
+    async def test_both_sweeps_are_scheduled_on_their_own_task(self, client):
+        from app.worker.celery_app import celery_app
+
+        schedule = celery_app.conf.beat_schedule
+        tasks = {name: entry["task"] for name, entry in schedule.items()}
+        assert tasks["purge-expired-conversations"] == "maintenance.purge_expired_conversations"
+        assert tasks["purge-expired-memory"] == "nuvrag_mem.purge_expired_memory"
+        # Both discarded rather than queued up if no worker was running to take them.
+        for entry in schedule.values():
+            assert entry["options"]["expires"] == 60 * 60 * 6
+            assert entry["options"]["queue"] == "default"
 
 
 @pytest.mark.skipif(

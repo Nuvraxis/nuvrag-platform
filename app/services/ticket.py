@@ -22,7 +22,7 @@ from app.repositories import (
     UserRepository,
 )
 from app.schemas.ticket import TicketCreate, TicketUpdate
-from app.services.nuvrag_mem import notes_for_subject
+from app.services.nuvrag_mem import forget_visitor_in, notes_for_subject
 
 logger = get_logger(__name__)
 
@@ -269,6 +269,39 @@ async def reply_to_ticket(org_id: UUID, ticket_id: UUID, actor: User, content: s
     return message
 
 
+async def forget_ticket_visitor(org_id: UUID, ticket_id: UUID) -> int:
+    """Erase everything remembered about whoever opened this ticket.
+
+    Keyed on a ticket rather than on the subject itself, and that is deliberate. The subject
+    *is* the visitor's session id, which since iteration 7 replays their transcript — putting
+    it in a URL would write a bearer capability into ingress access logs, browser history and
+    `Referer`, which is the leak iteration 7 removed. The dashboard is not given it either
+    (see `MemoryNoteRead`), so it could not name one here even if the route asked for it.
+
+    What gets erased is still the *person*, not the conversation: every note for that subject
+    on that chatbot, whatever conversation each was learned in and whether or not that
+    conversation still exists. The ticket only says who.
+    """
+    async with tenant_session(org_id) as session:
+        ticket = await _load(session, org_id, ticket_id)
+        conversation = await ConversationRepository(session).get(ticket.conversation_id)
+        if conversation is None:
+            return 0
+        forgotten = await forget_visitor_in(
+            session,
+            chatbot_id=ticket.chatbot_id,
+            subject_id=conversation.external_session_id,
+        )
+
+    logger.info(
+        "nuvrag_mem.ticket_visitor_forgotten",
+        org_id=str(org_id),
+        ticket_id=str(ticket_id),
+        deleted=forgotten,
+    )
+    return forgotten
+
+
 async def session_state(
     org_id: UUID, chatbot_id: UUID, external_session_id: str
 ) -> tuple[Conversation, list[Message], TicketStatus | None] | None:
@@ -330,6 +363,7 @@ __all__ = [
     "TicketView",
     "assign_ticket",
     "create_ticket",
+    "forget_ticket_visitor",
     "get_ticket",
     "list_tickets",
     "reply_to_ticket",

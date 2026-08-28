@@ -118,3 +118,22 @@ def extract_visitor_memory_task(org_id: str, conversation_id: str) -> dict[str, 
         "duplicates": report.duplicates,
         "skipped": report.skipped,
     }
+
+
+@celery_app.task(name="nuvrag_mem.purge_expired_memory")
+def purge_expired_memory_task() -> dict[str, Any]:
+    """Apply every chatbot's `nuvrag_mem_retention_days`. Scheduled by beat; see `celery_app`.
+
+    Deliberately not retried, for the reason the conversation sweep gives: the next run is a
+    day away, and re-running a half-finished sweep costs another full scan for rows the first
+    pass already deleted.
+    """
+    from app.services.nuvrag_mem import purge_expired_memory
+
+    report = _run(purge_expired_memory())
+    return {
+        "chatbots_considered": report.chatbots_considered,
+        "entries_deleted": report.entries_deleted,
+        "incomplete": report.incomplete,
+        "skipped_locked": report.skipped_locked,
+    }

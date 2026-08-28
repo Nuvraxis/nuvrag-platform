@@ -2,7 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Query, status
 
-from app.api.deps import CurrentPrincipal, Pagination
+from app.api.deps import CurrentPrincipal, Pagination, RequireAdmin
 from app.models import TicketStatus
 from app.schemas.chat import MessageRead
 from app.schemas.common import Page
@@ -76,3 +76,22 @@ async def reply_to_ticket(
         principal.org_id, ticket_id, principal.user, payload.content
     )
     return MessageRead.model_validate(message)
+
+
+@router.delete(
+    "/{ticket_id}/memory",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Forget everything remembered about this ticket's visitor",
+)
+async def forget_visitor_memory(ticket_id: UUID, principal: RequireAdmin) -> None:
+    """Irreversible, and the way an erasure request is honoured for visitor memory.
+
+    Admin or above, matching conversation and document deletion. Unlike the scheduled sweep it
+    steps over nothing: an open ticket does not hold a person's notes here, because somebody
+    has asked for this specific person to be forgotten and a request that quietly did nothing
+    would be worse than no request at all.
+
+    Keyed on the ticket rather than on the visitor's session id, which is a bearer capability
+    and therefore has no business in a URL — see `forget_ticket_visitor`.
+    """
+    await ticket_service.forget_ticket_visitor(principal.org_id, ticket_id)

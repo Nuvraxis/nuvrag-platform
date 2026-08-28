@@ -18,6 +18,7 @@ from app.core.logging import get_logger
 from app.core.security import utcnow
 from app.db.session import system_session, tenant_session
 from app.repositories import ChatbotRepository, ConversationRepository
+from app.services.nuvrag_mem import forget_visitor_in
 from app.services.redis_client import held_lock
 
 logger = get_logger(__name__)
@@ -38,12 +39,22 @@ async def delete_conversation(org_id: UUID, chatbot_id: UUID, conversation_id: U
         # not that it belongs to the chatbot named in the path.
         if conversation is None or conversation.chatbot_id != chatbot_id:
             raise NotFoundError(f"Conversation {conversation_id} not found")
+
+        # Memory does not cascade — `source_conversation_id` is SET NULL precisely so that a
+        # transcript ageing out is not silently an erasure. But this is not the sweep: someone
+        # has asked for this transcript to go, and leaving behind a standing summary of the
+        # person who wrote it would not honour that. Same transaction, so either both go or
+        # neither does.
+        forgotten = await forget_visitor_in(
+            session, chatbot_id=chatbot_id, subject_id=conversation.external_session_id
+        )
         await repo.delete(conversation)
 
     logger.info(
         "conversation.deleted",
         conversation_id=str(conversation_id),
         chatbot_id=str(chatbot_id),
+        memory_forgotten=forgotten,
     )
 
 

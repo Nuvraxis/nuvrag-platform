@@ -4598,6 +4598,48 @@
         ]
       }
     },
+    "/api/v1/tickets/{ticket_id}/memory": {
+      "delete": {
+        "description": "Irreversible, and the way an erasure request is honoured for visitor memory.\n\nAdmin or above, matching conversation and document deletion. Unlike the scheduled sweep it\nsteps over nothing: an open ticket does not hold a person's notes here, because somebody\nhas asked for this specific person to be forgotten and a request that quietly did nothing\nwould be worse than no request at all.\n\nKeyed on the ticket rather than on the visitor's session id, which is a bearer capability\nand therefore has no business in a URL — see `forget_ticket_visitor`.",
+        "operationId": "forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Forget everything remembered about this ticket's visitor",
+        "tags": [
+          "tickets"
+        ]
+      }
+    },
     "/api/v1/tickets/{ticket_id}/messages": {
       "post": {
         "description": "The reply lands in the conversation the ticket wraps, as `role='staff'`.",

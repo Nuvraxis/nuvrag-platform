@@ -43,7 +43,7 @@ export default async function TranscriptPage({
             variant="destructive"
             size="sm"
             confirmTitle="Delete this conversation?"
-            confirmDescription="The transcript and any support ticket raised from it are removed. This cannot be undone."
+            confirmDescription="The transcript, any support ticket raised from it, and everything remembered about this visitor are removed. This cannot be undone."
             confirmLabel="Delete conversation"
             pendingLabel="Deleting…"
           >

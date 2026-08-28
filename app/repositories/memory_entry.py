@@ -1,15 +1,16 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import cast, update
+from sqlalchemy import cast, delete, exists, update
 from sqlmodel import func, select
 
 from app.core.security import utcnow
-from app.models import MemoryEntry
+from app.models import Conversation, MemoryEntry, Ticket
 from app.repositories.base import BaseRepository
+from app.repositories.conversation import UNRESOLVED_TICKET_STATUSES
 
 # How stale a note has to be before a retrieval bothers to refresh it. `last_referenced_at`
 # is itself indexed, so changing it cannot be a HOT update: every bump writes a new tuple
@@ -157,3 +158,60 @@ class MemoryEntryRepository(BaseRepository[MemoryEntry]):
             .limit(limit)
         )
         return list(result.scalars())
+
+    async def delete_for_subject(self, chatbot_id: UUID, subject_id: str) -> int:
+        """Every note about one visitor on one chatbot. The erasure primitive.
+
+        Deliberately unconditional. It ignores the open-ticket pin the sweep respects, for the
+        same reason `delete_conversation` ignores it: somebody has asked for this specific
+        person to be forgotten, and an erasure request that quietly did nothing because a
+        ticket happened to be open would be worse than useless.
+        """
+        result = await self.session.execute(
+            delete(MemoryEntry).where(
+                MemoryEntry.chatbot_id == chatbot_id, MemoryEntry.subject_id == subject_id
+            )
+        )
+        return int(result.rowcount or 0)
+
+    async def expired_ids(self, chatbot_id: UUID, *, cutoff: datetime, limit: int) -> list[UUID]:
+        """Notes unused since `cutoff` that no unresolved ticket is holding open.
+
+        `last_referenced_at` rather than `created_at`: a note the assistant is still using has
+        not gone stale just because it was learned a while ago, which is the same reasoning
+        that ages a conversation on `updated_at`.
+
+        The pin extends the rule conversations already have. Losing what is known about a
+        visitor while staff are actively working their open ticket would be a worse failure
+        than keeping it a little longer, so an open or pending ticket anywhere in that
+        subject's history holds all of their notes. Resolving or closing it releases the pin.
+
+        The join is on `(chatbot_id, external_session_id)` because that pair is what a subject
+        *is*: the same session id on another chatbot is another person's business.
+        """
+        pinned = (
+            select(Ticket.id)
+            .join(Conversation, Conversation.id == Ticket.conversation_id)
+            .where(
+                Conversation.chatbot_id == MemoryEntry.chatbot_id,
+                Conversation.external_session_id == MemoryEntry.subject_id,
+                Ticket.status.in_(UNRESOLVED_TICKET_STATUSES),
+            )
+        )
+        result = await self.session.execute(
+            select(MemoryEntry.id)
+            .where(MemoryEntry.chatbot_id == chatbot_id)
+            .where(MemoryEntry.last_referenced_at < cutoff)
+            .where(~exists(pinned))
+            .order_by(MemoryEntry.last_referenced_at)
+            .limit(limit)
+        )
+        return list(result.scalars())
+
+    async def delete_by_ids(self, entry_ids: Sequence[UUID]) -> int:
+        if not entry_ids:
+            return 0
+        result = await self.session.execute(
+            delete(MemoryEntry).where(MemoryEntry.id.in_(entry_ids))
+        )
+        return int(result.rowcount or 0)

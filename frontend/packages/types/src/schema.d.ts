@@ -502,6 +502,34 @@ export interface paths {
         patch: operations["update_ticket_api_v1_tickets__ticket_id__patch"];
         trace?: never;
     };
+    "/api/v1/tickets/{ticket_id}/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Forget everything remembered about this ticket's visitor
+         * @description Irreversible, and the way an erasure request is honoured for visitor memory.
+         *
+         *     Admin or above, matching conversation and document deletion. Unlike the scheduled sweep it
+         *     steps over nothing: an open ticket does not hold a person's notes here, because somebody
+         *     has asked for this specific person to be forgotten and a request that quietly did nothing
+         *     would be worse than no request at all.
+         *
+         *     Keyed on the ticket rather than on the visitor's session id, which is a bearer capability
+         *     and therefore has no business in a URL — see `forget_ticket_visitor`.
+         */
+        delete: operations["forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tickets/{ticket_id}/messages": {
         parameters: {
             query?: never;
@@ -2900,6 +2928,35 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TicketRead"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ticket_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

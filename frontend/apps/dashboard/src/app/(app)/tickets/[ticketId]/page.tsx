@@ -4,11 +4,14 @@ import type { Metadata } from 'next'
 import Link from 'next/link'
 import { Suspense } from 'react'
 
+import { ActionForm } from '@/components/action-form'
+import { ConfirmSubmit } from '@/components/confirm-submit'
 import PageLoading from '@/components/page-loading'
 import { PageHeader } from '@/components/page-header'
 import { TicketControls } from '@/components/ticket-controls'
 import { TicketPriorityBadge, TicketStatusBadge } from '@/components/status-badge'
 import { TicketReplyForm } from '@/components/ticket-reply-form'
+import { forgetVisitorMemoryAction } from '@/lib/actions/tickets'
 import { fetchApi } from '@/lib/api'
 import { formatDateTime, formatDuration } from '@/lib/format'
 
@@ -198,6 +201,23 @@ async function TicketDetail({ params }: { params: Promise<{ ticketId: string }> 
                   Showing the {memory.notes.length} most recent of {memory.total}.
                 </p>
               ) : null}
+
+              {/* How an erasure request is honoured for memory, rather than waiting for the
+                  retention window — which a tenant may have set to keep it indefinitely.
+                  Unlike the sweep this does not step over an open ticket. */}
+              <ActionForm action={forgetVisitorMemoryAction} announceSuccess={false}>
+                <input type="hidden" name="ticket_id" value={ticket.id} />
+                <ConfirmSubmit
+                  variant="destructive"
+                  size="sm"
+                  confirmTitle="Forget this visitor?"
+                  confirmDescription="Every note about this person is deleted, including any learned in conversations that have since been removed. The transcript itself is kept. This cannot be undone."
+                  confirmLabel="Forget visitor"
+                  pendingLabel="Forgetting…"
+                >
+                  Forget this visitor
+                </ConfirmSubmit>
+              </ActionForm>
             </>
           )}
         </CardContent>

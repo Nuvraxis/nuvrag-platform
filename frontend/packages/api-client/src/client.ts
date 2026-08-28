@@ -364,6 +364,16 @@ export class ApiClient {
     return this.send('PATCH', `/api/v1/tickets/${encode(ticketId)}`, { body, ...options })
   }
 
+  /**
+   * Erases everything remembered about this ticket's visitor.
+   *
+   * Keyed on the ticket rather than on the visitor, because the subject of a note is their
+   * session id — a bearer capability the dashboard is deliberately never given.
+   */
+  async forgetVisitorMemory(ticketId: string, options?: RequestOptions): Promise<void> {
+    await this.send('DELETE', `/api/v1/tickets/${encode(ticketId)}/memory`, options)
+  }
+
   /** Appends a staff reply to the ticket's conversation as a `role='staff'` message. */
   replyToTicket(ticketId: string, body: TicketReply, options?: RequestOptions): Promise<Message> {
     return this.send('POST', `/api/v1/tickets/${encode(ticketId)}/messages`, {

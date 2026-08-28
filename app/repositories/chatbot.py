@@ -57,3 +57,19 @@ class ChatbotRepository(BaseRepository[Chatbot]):
         stmt = stmt.order_by(Chatbot.created_at.desc()).limit(limit).offset(offset)
         result = await self.session.execute(stmt)
         return list(result.scalars())
+
+    async def with_nuvrag_mem_retention(self) -> list[tuple[UUID, UUID, int]]:
+        """`(org_id, chatbot_id, nuvrag_mem_retention_days)` for every chatbot that keeps
+        visitor memory for a bounded time.
+
+        Unscoped for the same reason `with_retention` is, and just as thin: two ids and a day
+        count, never any remembered content. The deletes themselves go back through
+        `tenant_session`. Note that most chatbots appear here — memory ships with a 30-day
+        window — whereas most are absent from `with_retention`, which starts at forever.
+        """
+        result = await self.session.execute(
+            select(Chatbot.org_id, Chatbot.id, Chatbot.nuvrag_mem_retention_days)
+            .where(Chatbot.nuvrag_mem_retention_days.is_not(None))
+            .order_by(Chatbot.org_id, Chatbot.id)
+        )
+        return [(org_id, chatbot_id, int(days)) for org_id, chatbot_id, days in result.all()]
