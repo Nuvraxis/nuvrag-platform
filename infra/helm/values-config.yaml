@@ -17,7 +17,7 @@ image:
   # Must match `github.repository` from the release workflow, lowercased — that workflow
   # pushes ghcr.io/<owner>/<repo>-api and friends. A mismatch here fails as ImagePullBackOff.
   repository: nuvraxis/nuvrag-platform
-  tag: "sha-9d02a73ebfee157452360f3f607bb26df801a3ff"
+  tag: "sha-a75febe8407e5a935d5733567c40c842f458819d"
   # GHCR packages are private until published. Create the pull secret first:
   #   kubectl create secret docker-registry ghcr -n rag \
   #     --docker-server=ghcr.io --docker-username=USER --docker-password=PAT
@@ -96,11 +96,11 @@ ingress:
 # Sizing. Autoscalers and disruption budgets stay off until the workload is spread across
 # more than one node: a PDB of minAvailable 1 against a single replica blocks kubectl drain.
 api:
-  replicaCount: 2
+  replicaCount: 1
 
 worker:
-  replicaCount: 2
-  concurrency: 4
+  replicaCount: 1
+  concurrency: 2
 
 dashboard:
   replicaCount: 1
