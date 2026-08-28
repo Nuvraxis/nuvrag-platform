@@ -15,6 +15,7 @@ from app.repositories import (
     DocumentChunkRepository,
     MessageRepository,
     RetrievedChunk,
+    TicketRepository,
 )
 from app.services.ai import factory
 from app.services.ai.prompts import Citation, build_chat_messages, build_citations
@@ -43,6 +44,16 @@ class ChatContext:
     chatbot_id: UUID
     system_prompt: str
     generation_config: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedTurn:
+    conversation_id: UUID
+    message_id: UUID
+    # Whether this visitor has ever asked for a human, read in the same transaction that
+    # wrote the turn. It decides only whether memory extraction is worth queueing; the task
+    # asks the question again for itself, because that is where the write happens.
+    subject_is_durable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +133,7 @@ async def _persist_turn(
     answer: str,
     citations: list[Citation],
     latency_ms: int,
-) -> tuple[UUID, UUID]:
+) -> PersistedTurn:
     async with tenant_session(context.org_id) as session:
         conversation = await _ensure_conversation(
             session, context.org_id, context.chatbot_id, external_session_id
@@ -155,7 +166,33 @@ async def _persist_turn(
             conversation.title = question[:300]
         session.add(conversation)
 
-        return conversation.id, assistant.id
+        return PersistedTurn(
+            conversation_id=conversation.id,
+            message_id=assistant.id,
+            subject_is_durable=await TicketRepository(session).exists_for_conversation(
+                conversation.id
+            ),
+        )
+
+
+def _enqueue_memory_extraction(org_id: UUID, conversation_id: UUID) -> None:
+    """Hand the turn to the worker, best effort.
+
+    Only ids cross the broker. The session id has been a bearer capability since iteration 7
+    and a Celery message body sits in Redis for as long as the broker keeps it, so the task
+    reads the session id from the conversation row under RLS instead of being handed it.
+
+    A broker that is down costs a memory, never an answer: the visitor has already been sent
+    every token of theirs by the time this runs.
+    """
+    from app.worker.tasks import extract_visitor_memory_task
+
+    try:
+        extract_visitor_memory_task.apply_async(args=[str(org_id), str(conversation_id)])
+    except Exception as exc:  # noqa: BLE001 - a broker outage must not fail a delivered answer
+        logger.warning(
+            "nuvrag_mem.enqueue_failed", conversation_id=str(conversation_id), error=str(exc)
+        )
 
 
 async def stream_answer(
@@ -215,7 +252,7 @@ async def stream_answer(
 
     latency_ms = int((time.perf_counter() - started) * 1000)
 
-    _, message_id = await _persist_turn(
+    turn = await _persist_turn(
         context,
         external_session_id=external_session_id,
         question=question,
@@ -223,6 +260,9 @@ async def stream_answer(
         citations=citations,
         latency_ms=latency_ms,
     )
+
+    if settings.nuvrag_mem.enabled and turn.subject_is_durable:
+        _enqueue_memory_extraction(context.org_id, turn.conversation_id)
 
     log.info(
         "chat.completed",
@@ -234,7 +274,7 @@ async def stream_answer(
         "event": "done",
         "data": {
             "conversation_id": str(conversation_id),
-            "message_id": str(message_id),
+            "message_id": str(turn.message_id),
             "latency_ms": latency_ms,
             # Zero retrieved chunks is the same condition the prompt turns into "I do not
             # have information about that in the available documents", so it is already the

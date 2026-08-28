@@ -1,5 +1,6 @@
 from uuid import UUID
 
+from sqlalchemy import exists
 from sqlmodel import func, select
 
 from app.models import Ticket, TicketStatus
@@ -59,6 +60,22 @@ class TicketRepository(BaseRepository[Ticket]):
         )
         result = await self.session.execute(statement)
         return int(result.scalar_one())
+
+    async def exists_for_conversation(self, conversation_id: UUID) -> bool:
+        """Whether this conversation has ever been escalated to a human.
+
+        The one signal that says a visitor is durable. Opening a ticket is what promotes their
+        session id from `sessionStorage` to `localStorage` (iteration 7), so a visitor with a
+        ticket is the only kind this platform can recognise on a later visit — which makes
+        this, rather than a flag of its own, the gate on writing and reading their memory.
+
+        `EXISTS` rather than `latest_for_conversation`: the answer is a yes or a no, and the
+        newest ticket's columns are not wanted for it.
+        """
+        result = await self.session.execute(
+            select(exists(select(Ticket.id).where(Ticket.conversation_id == conversation_id)))
+        )
+        return bool(result.scalar())
 
     async def latest_for_conversation(self, conversation_id: UUID) -> Ticket | None:
         """The ticket a returning visitor is waiting on.

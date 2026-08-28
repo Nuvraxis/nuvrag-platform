@@ -10,7 +10,7 @@ history, but it cannot reach into another's.
 
 from dataclasses import dataclass, field
 from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError
@@ -18,19 +18,9 @@ from app.core.logging import get_logger
 from app.core.security import utcnow
 from app.db.session import system_session, tenant_session
 from app.repositories import ChatbotRepository, ConversationRepository
-from app.services.redis_client import get_redis
+from app.services.redis_client import held_lock
 
 logger = get_logger(__name__)
-
-# Compare-and-delete. A sweep that overran its lock TTL must not release a lock that by then
-# belongs to the run which replaced it — a plain DEL would let a third run start alongside
-# the second.
-_RELEASE_LOCK = """
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
-end
-return 0
-"""
 
 
 async def delete_conversation(org_id: UUID, chatbot_id: UUID, conversation_id: UUID) -> None:
@@ -76,18 +66,12 @@ async def purge_expired_conversations() -> PurgeReport:
     Returns immediately if another sweep holds the lock, which is what keeps a beat restart
     or an overrunning run from producing two passes over the same rows.
     """
-    redis = get_redis()
-    key = settings.retention.lock_key
-    token = uuid4().hex
-
-    if not await redis.set(key, token, nx=True, ex=settings.retention.lock_ttl_seconds):
-        logger.info("retention.sweep_already_running")
-        return PurgeReport(skipped_locked=True)
-
-    try:
+    lock = held_lock(settings.retention.lock_key, ttl_seconds=settings.retention.lock_ttl_seconds)
+    async with lock as acquired:
+        if not acquired:
+            logger.info("retention.sweep_already_running")
+            return PurgeReport(skipped_locked=True)
         return await _sweep()
-    finally:
-        await redis.eval(_RELEASE_LOCK, 1, key, token)
 
 
 async def _sweep() -> PurgeReport:

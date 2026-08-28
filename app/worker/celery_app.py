@@ -31,6 +31,9 @@ celery_app.conf.update(
         # bulk-uploading 50 PDFs cannot starve lightweight background work.
         "ingestion.*": {"queue": INGESTION_QUEUE},
         "maintenance.*": {"queue": DEFAULT_QUEUE},
+        # Explicit rather than left to `task_default_queue`, so that routing stays a
+        # statement about where this work belongs instead of a default nobody chose.
+        "nuvrag_mem.*": {"queue": DEFAULT_QUEUE},
     },
     task_acks_late=True,
     task_reject_on_worker_lost=True,
