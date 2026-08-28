@@ -375,6 +375,21 @@
             "title": "Name",
             "type": "string"
           },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 30,
+            "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
+            "title": "Nuvrag Mem Retention Days"
+          },
           "privacy_url": {
             "default": "",
             "description": "Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.",
@@ -474,6 +489,17 @@
             "title": "Name",
             "type": "string"
           },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nuvrag Mem Retention Days"
+          },
           "org_id": {
             "format": "uuid",
             "title": "Org Id",
@@ -535,6 +561,7 @@
           "model_config_json",
           "theme_json",
           "retention_days",
+          "nuvrag_mem_retention_days",
           "privacy_url",
           "terms_url",
           "public_key",
@@ -625,6 +652,20 @@
               }
             ],
             "title": "Name"
+          },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
+            "title": "Nuvrag Mem Retention Days"
           },
           "privacy_url": {
             "anyOf": [

@@ -10,6 +10,7 @@ import {
   chatbotStatus,
   generationConfig,
   number,
+  nuvragMemRetentionDays,
   optionalText,
   originList,
   retentionDays,
@@ -48,6 +49,7 @@ export async function createChatbotAction(
       allowed_origins: originList(formData, 'allowed_origins'),
       model_config_json: generationConfig(formData),
       retention_days: retentionDays(formData),
+      nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
       // Empty on purpose. The footer links are edited on the design tab beside the widget
       // preview that shows them, so the create form does not ask for them — a chatbot starts
       // with none, exactly as it starts with no theme.

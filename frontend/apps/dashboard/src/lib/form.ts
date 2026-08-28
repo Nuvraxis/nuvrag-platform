@@ -43,6 +43,27 @@ export function retentionDays(formData: FormData): number | null {
   return Number.isFinite(parsed) ? Math.round(parsed) : null
 }
 
+/** A chatbot starts at 30 days of visitor memory rather than at "forever". */
+export const NUVRAG_MEM_RETENTION_DEFAULT_DAYS = 30
+
+/**
+ * The same blank-means-forever spelling as `retentionDays`, with one extra distinction it
+ * does not need. Conversation retention defaults to "forever", so a field that is absent and
+ * a field that is blank mean the same thing. Memory defaults to 30, so they do not: absent is
+ * a form that never asked, and must fall back to the default, while present-and-blank is a
+ * tenant deliberately choosing to keep memory forever. `FormData.has` is what tells them
+ * apart — reading the value alone cannot.
+ */
+export function nuvragMemRetentionDays(formData: FormData): number | null {
+  if (!formData.has('nuvrag_mem_retention_days')) {
+    return NUVRAG_MEM_RETENTION_DEFAULT_DAYS
+  }
+  const raw = text(formData, 'nuvrag_mem_retention_days')
+  if (!raw) return null
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? Math.round(parsed) : null
+}
+
 export function generationConfig(formData: FormData): GenerationConfig {
   return {
     temperature: number(formData, 'temperature', 0.2),

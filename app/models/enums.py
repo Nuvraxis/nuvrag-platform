@@ -84,6 +84,27 @@ class TicketSource(StrEnum):
     VISITOR_CONTACT_FORM = "visitor_contact_form"
 
 
+class MemorySubjectType(StrEnum):
+    """Who a `memory_entry` is about.
+
+    `visitor` keys on the durable `external_session_id` a ticket promoted to local storage;
+    `staff_user` keys on `app_user.id`. Both are text in one column, so the type is what says
+    how to read the subject rather than leaving that to whoever writes the next query.
+    """
+
+    VISITOR = "visitor"
+    STAFF_USER = "staff_user"
+
+
+class MemoryType(StrEnum):
+    """What kind of thing was remembered — a stated preference, a stable fact about them, or
+    situational context that made sense of a conversation."""
+
+    PREFERENCE = "preference"
+    FACT = "fact"
+    CONTEXT = "context"
+
+
 # The `Name` suffix keeps these clear of the `ChatProvider` / `EmbeddingProvider` protocols in
 # app/services/ai/base.py: these are the values a column holds, those are the things that
 # actually make the calls.

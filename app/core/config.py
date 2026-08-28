@@ -218,6 +218,55 @@ class RetentionSettings(BaseSettings):
     lock_ttl_seconds: int = Field(default=3600, ge=60)
 
 
+class NuvragMemSettings(BaseSettings):
+    """Per-visitor memory: what is extracted, what is retrieved, and when it is swept.
+
+    *How long* an entry is kept is not here, for the same reason retention's duration is not:
+    it is `chatbot.nuvrag_mem_retention_days`, per tenant, because the obligation belongs to
+    whoever's visitors are being remembered rather than to whoever runs the cluster.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="NUVRAG_MEM_", env_file=".env", extra="ignore")
+
+    # Off would mean no extraction and no retrieval; the tables and columns still exist, so
+    # turning it back on loses nothing already written.
+    enabled: bool = True
+
+    # --- read path ---
+    # Deliberately smaller than `RETRIEVAL_TOP_K`. Memory is a handful of sentences about one
+    # person, not a corpus, and a large k here mostly buys weakly-related facts crowding the
+    # prompt next to the documents that actually answer the question.
+    retrieval_top_k: int = Field(default=5, ge=1, le=50)
+    # Higher than document retrieval's 0.25 floor, because the cost of a wrong hit is worse:
+    # an irrelevant passage is ignorable, whereas an irrelevant "fact about you" is the model
+    # confidently telling a visitor something untrue about themselves.
+    retrieval_min_similarity: float = Field(default=0.45, ge=0.0, le=1.0)
+
+    # --- write path ---
+    # How many recent turns the extractor is shown. Enough for a preference stated across two
+    # or three messages, short enough that the call stays cheap on every assistant turn.
+    extraction_window_messages: int = Field(default=6, ge=2, le=40)
+    # A ceiling on what one turn may produce, so a model that decides to enumerate cannot
+    # write forty rows about a single exchange.
+    max_entries_per_extraction: int = Field(default=3, ge=1, le=20)
+    # Above this cosine similarity to an entry the subject already has, the new one is a
+    # restatement and is dropped. A preference mentioned five times should be one row.
+    dedupe_similarity: float = Field(default=0.92, ge=0.0, le=1.0)
+    # A hard ceiling per visitor per chatbot. Without one, a talkative regular accumulates
+    # rows forever and their retrieval slowly degrades into a lucky dip.
+    max_entries_per_subject: int = Field(default=200, ge=1)
+
+    # --- sweep ---
+    # Shares beat with the conversation sweep and the same off-peak hour, but never its lock:
+    # one key for two different sweeps would let whichever ran first silently skip the other.
+    purge_hour_utc: int = Field(default=3, ge=0, le=23)
+    purge_minute_utc: int = Field(default=45, ge=0, le=59)
+    purge_batch_size: int = Field(default=500, ge=1, le=10_000)
+    purge_max_batches_per_chatbot: int = Field(default=40, ge=1)
+    lock_key: str = "maintenance:purge-nuvrag-mem"
+    lock_ttl_seconds: int = Field(default=3600, ge=60)
+
+
 class RateLimitSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RATE_LIMIT_", env_file=".env", extra="ignore")
 
@@ -273,6 +322,7 @@ class Settings(BaseSettings):
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
+    nuvrag_mem: NuvragMemSettings = Field(default_factory=NuvragMemSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 

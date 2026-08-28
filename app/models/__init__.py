@@ -11,6 +11,8 @@ from app.models.enums import (
     EmbeddingProviderName,
     FileType,
     InvitationStatus,
+    MemorySubjectType,
+    MemoryType,
     MessageRole,
     Plan,
     TicketPriority,
@@ -19,6 +21,7 @@ from app.models.enums import (
     UserRole,
 )
 from app.models.invitation import Invitation
+from app.models.memory_entry import MemoryEntry
 from app.models.organization import Organization
 from app.models.ticket import Ticket
 from app.models.user import User
@@ -39,6 +42,9 @@ __all__ = [
     "FileType",
     "Invitation",
     "InvitationStatus",
+    "MemoryEntry",
+    "MemorySubjectType",
+    "MemoryType",
     "Message",
     "MessageRole",
     "Organization",

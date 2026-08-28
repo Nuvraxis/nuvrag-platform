@@ -6,7 +6,14 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ChatbotStatus
-from app.models.chatbot import LINK_MAX_LENGTH, RETENTION_MAX_DAYS, RETENTION_MIN_DAYS
+from app.models.chatbot import (
+    LINK_MAX_LENGTH,
+    NUVRAG_MEM_RETENTION_DEFAULT_DAYS,
+    NUVRAG_MEM_RETENTION_MAX_DAYS,
+    NUVRAG_MEM_RETENTION_MIN_DAYS,
+    RETENTION_MAX_DAYS,
+    RETENTION_MIN_DAYS,
+)
 
 
 def validate_link(value: str) -> str:
@@ -56,6 +63,30 @@ def retention_field() -> Any:
         ge=RETENTION_MIN_DAYS,
         le=RETENTION_MAX_DAYS,
         description=RETENTION_DESCRIPTION,
+    )
+
+
+NUVRAG_MEM_RETENTION_DESCRIPTION = (
+    "Days of remembered visitor detail to keep, counted from when an entry was last used to "
+    "answer a question. Null keeps it indefinitely. Unlike conversation retention this "
+    f"defaults to {NUVRAG_MEM_RETENTION_DEFAULT_DAYS} days rather than to null, because a "
+    "memory is a standing summary of a person rather than a record of one conversation. "
+    "Memory for a visitor with an unresolved ticket is never purged."
+)
+
+
+def nuvrag_mem_retention_field(*, default: int | None = NUVRAG_MEM_RETENTION_DEFAULT_DAYS) -> Any:
+    """The default is passed rather than fixed because it means two different things.
+
+    On create it is the value a new chatbot starts at, 30. On patch it must be `None`, which
+    there means "not named, leave alone" — baking 30 in would turn every unrelated PATCH into
+    a silent reset of a tenant's memory window.
+    """
+    return Field(
+        default=default,
+        ge=NUVRAG_MEM_RETENTION_MIN_DAYS,
+        le=NUVRAG_MEM_RETENTION_MAX_DAYS,
+        description=NUVRAG_MEM_RETENTION_DESCRIPTION,
     )
 
 
@@ -127,6 +158,7 @@ class ChatbotCreate(BaseModel):
     model_config_json: GenerationConfig = Field(default_factory=GenerationConfig)
     theme_json: WidgetTheme = Field(default_factory=WidgetTheme)
     retention_days: int | None = retention_field()
+    nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field()
     privacy_url: str = link_field(PRIVACY_DESCRIPTION)
     terms_url: str = link_field(TERMS_DESCRIPTION)
 
@@ -155,6 +187,9 @@ class ChatbotUpdate(BaseModel):
     # omission: it is how a tenant turns retention back off. `update_chatbot` reinstates it
     # for exactly that reason — see the comment there.
     retention_days: int | None = retention_field()
+    # Same treatment, same reason: null here is "keep memory forever", so it is
+    # reinstated after `exclude_none` when the caller actually named it.
+    nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field(default=None)
     # `None` is "unchanged" and `""` is "remove the link", the same split as `description`.
     privacy_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
     terms_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
@@ -185,6 +220,7 @@ class ChatbotRead(BaseModel):
     model_config_json: dict[str, Any]
     theme_json: dict[str, Any]
     retention_days: int | None
+    nuvrag_mem_retention_days: int | None
     privacy_url: str
     terms_url: str
     public_key: str

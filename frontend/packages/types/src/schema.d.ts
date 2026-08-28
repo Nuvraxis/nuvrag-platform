@@ -764,6 +764,12 @@ export interface components {
             /** Name */
             name: string;
             /**
+             * Nuvrag Mem Retention Days
+             * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
+             * @default 30
+             */
+            nuvrag_mem_retention_days: number | null;
+            /**
              * Privacy Url
              * @description Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.
              * @default
@@ -814,6 +820,8 @@ export interface components {
             };
             /** Name */
             name: string;
+            /** Nuvrag Mem Retention Days */
+            nuvrag_mem_retention_days: number | null;
             /**
              * Org Id
              * Format: uuid
@@ -869,6 +877,11 @@ export interface components {
             model_config_json?: components["schemas"]["GenerationConfig"] | null;
             /** Name */
             name?: string | null;
+            /**
+             * Nuvrag Mem Retention Days
+             * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
+             */
+            nuvrag_mem_retention_days?: number | null;
             /** Privacy Url */
             privacy_url?: string | null;
             /**

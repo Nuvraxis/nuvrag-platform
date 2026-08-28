@@ -33,6 +33,25 @@ RETENTION_CHECK = (
     f"retention_days BETWEEN {RETENTION_MIN_DAYS} AND {RETENTION_MAX_DAYS}"
 )
 
+# The same bounds for nuvrag_mem, declared separately so the two can diverge without one
+# quietly dragging the other with it.
+NUVRAG_MEM_RETENTION_MIN_DAYS = 1
+NUVRAG_MEM_RETENTION_MAX_DAYS = 3650
+
+# Deliberately 30 rather than the NULL that `retention_days` defaults to, and the contrast is
+# the point rather than an oversight. A transcript is a record of one conversation; a memory
+# is a standing summary of a person across visits, which is the more sensitive of the two and
+# the one a tenant is less likely to think to configure. So memory ships with a window
+# already on, and a tenant who genuinely wants it kept forever clears the field — the same
+# blank-means-forever spelling, reached from the opposite direction.
+NUVRAG_MEM_RETENTION_DEFAULT_DAYS = 30
+
+NUVRAG_MEM_RETENTION_CHECK = (
+    f"nuvrag_mem_retention_days IS NULL OR "
+    f"nuvrag_mem_retention_days BETWEEN "
+    f"{NUVRAG_MEM_RETENTION_MIN_DAYS} AND {NUVRAG_MEM_RETENTION_MAX_DAYS}"
+)
+
 # Footer links. Long enough for a real policy URL with a path and a query, short enough that
 # the column is not somewhere to put a document.
 LINK_MAX_LENGTH = 500
@@ -46,6 +65,7 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
         enum_check("status", ChatbotStatus),
         # The naming convention expands `name` into `ck_chatbot_retention_days`.
         CheckConstraint(RETENTION_CHECK, name="retention_days"),
+        CheckConstraint(NUVRAG_MEM_RETENTION_CHECK, name="nuvrag_mem_retention_days"),
     )
 
     # `model_config_json` collides with Pydantic's reserved `model_` namespace.
@@ -77,6 +97,15 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
     # what the platform did unconditionally before it existed. Retention therefore never
     # switches itself on: deleting a tenant's history is an explicit choice they make.
     retention_days: int | None = Field(default=None, nullable=True)
+
+    # How long nuvrag_mem entries are kept, counted from `last_referenced_at`. NULL still
+    # means forever, but unlike `retention_days` this starts at 30 — see the constant's note
+    # for why the two neighbouring columns deliberately disagree.
+    nuvrag_mem_retention_days: int | None = Field(
+        default=NUVRAG_MEM_RETENTION_DEFAULT_DAYS,
+        nullable=True,
+        sa_column_kwargs={"server_default": str(NUVRAG_MEM_RETENTION_DEFAULT_DAYS)},
+    )
 
     # Shown in the widget footer, above the branding. Deliberately *not* in `theme_json`:
     # "Reset to the default theme" empties that column outright, and quietly deleting a
