@@ -91,3 +91,49 @@ def purge_expired_conversations_task() -> dict[str, Any]:
         "incomplete": report.incomplete,
         "skipped_locked": report.skipped_locked,
     }
+
+
+@celery_app.task(name="nuvrag_mem.extract_visitor_memory")
+def extract_visitor_memory_task(org_id: str, conversation_id: str) -> dict[str, Any]:
+    """Write down what the recent turns say about one visitor. Queued after every assistant
+    turn on a conversation that already has a ticket.
+
+    Two ids and nothing else: the visitor's session id is a bearer capability, and this
+    argument list is a message body that sits in Redis, so the task reads the session id from
+    the conversation row under RLS rather than being handed it through the queue.
+
+    Deliberately not retried. Consecutive turns are extracted over overlapping windows, so a
+    failed attempt is covered by the next message rather than by a second attempt at this one
+    — and paying for another chat completion to recover a fact nobody is waiting for is the
+    wrong trade. Upstream failures are already reported as a skip; anything else is a bug and
+    is left to surface as a failed task.
+    """
+    from app.services.nuvrag_mem import extract_visitor_memory
+
+    report = _run(extract_visitor_memory(UUID(org_id), UUID(conversation_id)))
+    return {
+        "conversation_id": conversation_id,
+        "proposed": report.proposed,
+        "written": report.written,
+        "duplicates": report.duplicates,
+        "skipped": report.skipped,
+    }
+
+
+@celery_app.task(name="nuvrag_mem.purge_expired_memory")
+def purge_expired_memory_task() -> dict[str, Any]:
+    """Apply every chatbot's `nuvrag_mem_retention_days`. Scheduled by beat; see `celery_app`.
+
+    Deliberately not retried, for the reason the conversation sweep gives: the next run is a
+    day away, and re-running a half-finished sweep costs another full scan for rows the first
+    pass already deleted.
+    """
+    from app.services.nuvrag_mem import purge_expired_memory
+
+    report = _run(purge_expired_memory())
+    return {
+        "chatbots_considered": report.chatbots_considered,
+        "entries_deleted": report.entries_deleted,
+        "incomplete": report.incomplete,
+        "skipped_locked": report.skipped_locked,
+    }

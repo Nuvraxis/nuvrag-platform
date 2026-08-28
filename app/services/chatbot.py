@@ -33,6 +33,7 @@ def _build(org_id: UUID, payload: ChatbotCreate, slug: str, secret_key: str) -> 
         # saved today does not freeze in colours a later widget release would have moved.
         theme_json=payload.theme_json.model_dump(exclude_none=True),
         retention_days=payload.retention_days,
+        nuvrag_mem_retention_days=payload.nuvrag_mem_retention_days,
         privacy_url=payload.privacy_url,
         terms_url=payload.terms_url,
         public_key=generate_public_key(settings.environment),
@@ -94,13 +95,14 @@ async def update_chatbot(org_id: UUID, chatbot_id: UUID, payload: ChatbotUpdate)
     updates = payload.model_dump(exclude_unset=True, exclude_none=True)
 
     # `exclude_none` is what makes this a partial patch, and it is right for every field
-    # whose null means "leave it alone". `retention_days` is the exception: null there is the
-    # value meaning "keep transcripts forever", and dropping it would make retention a
-    # one-way switch a tenant could never turn back off. Only a field the caller actually
-    # named is reinstated, so an omitted one still means no change.
+    # whose null means "leave it alone". The two retention columns are the exceptions: null
+    # there is the value meaning "keep forever", and dropping it would make each a one-way
+    # switch a tenant could never turn back off. Only a field the caller actually named is
+    # reinstated, so an omitted one still means no change.
     named = payload.model_dump(exclude_unset=True)
-    if "retention_days" in named:
-        updates["retention_days"] = named["retention_days"]
+    for field in ("retention_days", "nuvrag_mem_retention_days"):
+        if field in named:
+            updates[field] = named[field]
 
     async with tenant_session(org_id) as session:
         repo = ChatbotRepository(session)

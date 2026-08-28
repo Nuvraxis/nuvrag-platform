@@ -286,6 +286,16 @@ than internal service names.
 | `RETENTION_PURGE_HOUR_UTC` / `_MINUTE_UTC` | `3` / `30` | UTC, not cluster-local |
 | `RETENTION_PURGE_BATCH_SIZE` | `500` | conversations deleted per transaction |
 | `RETENTION_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run, so one backlog cannot starve other tenants |
+| `NUVRAG_MEM_ENABLED` | `true` | whether visitor memory is written and read at all — see [Visitor memory](#visitor-memory) |
+| `NUVRAG_MEM_RETRIEVAL_TOP_K` | `5` | notes put in front of the model per question |
+| `NUVRAG_MEM_RETRIEVAL_MIN_SIMILARITY` | `0.45` | higher than document retrieval's floor: an irrelevant "fact about you" is worse than an irrelevant passage |
+| `NUVRAG_MEM_EXTRACTION_WINDOW_MESSAGES` | `6` | how much recent conversation the extractor is shown |
+| `NUVRAG_MEM_MAX_ENTRIES_PER_EXTRACTION` | `3` | ceiling on what one turn may record |
+| `NUVRAG_MEM_DEDUPE_SIMILARITY` | `0.92` | above this a new note is a restatement and is dropped |
+| `NUVRAG_MEM_MAX_ENTRIES_PER_SUBJECT` | `200` | hard ceiling per visitor per chatbot |
+| `NUVRAG_MEM_PURGE_HOUR_UTC` / `_MINUTE_UTC` | `3` / `45` | its own slot, and its own Redis lock |
+| `NUVRAG_MEM_PURGE_BATCH_SIZE` | `500` | notes deleted per transaction |
+| `NUVRAG_MEM_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run |
 | `RATE_LIMIT_ENABLED` | `true` | |
 | `RATE_LIMIT_CHATBOT_CAPACITY` / `_REFILL_PER_SECOND` | `120` / `2.0` | per chatbot |
 | `RATE_LIMIT_SESSION_CAPACITY` / `_REFILL_PER_SECOND` | `20` / `0.25` | per widget session — the session id is browser-generated, so this shapes traffic rather than stopping abuse |
@@ -553,6 +563,82 @@ never applied, which the chart warns about on install.
 # alongside the worker, when running from source
 uv run celery -A app.worker.celery_app.celery_app beat --loglevel=INFO
 ```
+
+## Visitor memory
+
+A returning visitor normally starts cold: conversations are keyed on a browser session, and
+that session ends. **Visitor memory** closes that for the one group of visitors this platform
+can actually recognise on a later visit — anyone who has asked for a human. Opening a ticket
+is what promotes their session id from `sessionStorage` to `localStorage`, so it is also what
+makes remembering them possible at all.
+
+Everyone else stays exactly as anonymous as before. Giving every visitor a durable identity on
+first load is a product and privacy decision this project has deliberately not taken, and it
+would need a consent notice rather than a code change.
+
+**What it does.** After an assistant turn on a conversation that already has a ticket, a
+background task asks the chatbot's own model to pull out a few short, atomic statements the
+visitor made about themselves, embeds them, and stores anything it does not already know. On a
+later visit those notes are searched by similarity to whatever the visitor just asked and the
+closest few are put in front of the model — in their **own fenced block**, separate from the
+document context, marked untrusted, and outranked by the documents wherever the two disagree.
+
+Three things it deliberately does not do:
+
+- **No model runs at read time.** Retrieval is the same vector search the documents use, on
+  the same query vector — a second embedding call would buy an identical result.
+- **Notes are never cited.** The `sources` event means "the passage this answer came from",
+  and a remembered fact about a person is not a document.
+- **Nothing crosses a chatbot.** Notes are scoped to `(chatbot_id, subject_id)`, so the same
+  visitor talking to a company's sales bot and its support bot is two separate memories.
+
+**Seeing it.** The ticket detail page has a read-only *What we remember about this visitor*
+panel showing the notes, what kind each is, and when it was learned and last used. The
+visitor's session id is deliberately **not** in that response — it is a bearer capability, and
+it has no business in a dashboard payload where it would reach browser history and
+screenshots.
+
+**How long it is kept.** Per chatbot, as **Delete visitor memory after** on the settings page
+(`nuvrag_mem_retention_days`). Unlike conversations this starts at **30 days** rather than at
+forever: a transcript records one exchange, whereas a note is a standing summary of a person
+across visits. Blank still means keep indefinitely, for a tenant who wants that.
+
+```bash
+# 90 days from a note's last use
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"nuvrag_mem_retention_days": 90}'
+
+# keep indefinitely
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"nuvrag_mem_retention_days": null}'
+```
+
+The clock runs from when a note was **last used to answer something**, not when it was
+learned, for the same reason a conversation ages on its last message. An **unresolved ticket
+pins** that visitor's notes however old they are, exactly as it pins their transcript.
+
+**Erasing a visitor.** *Forget this visitor* on the ticket page, or:
+
+```bash
+curl -X DELETE "$API/api/v1/tickets/$TICKET_ID/memory" \
+  -H "Authorization: Bearer $TOKEN"          # 204; admin or owner
+```
+
+It is keyed on the ticket rather than on the visitor's session id, because that id is a bearer
+capability and does not belong in a URL. What it erases is still the *person*: every note for
+them on that chatbot, whatever conversation each came from and whether or not that conversation
+still exists. Unlike the sweep it steps over nothing — an open ticket does not hold it up.
+
+Deleting a conversation **on request** now erases that visitor's notes too, so honouring an
+erasure request in one place does not leave a summary of the same person behind. The scheduled
+conversation sweep deliberately does not: the two retentions are separate settings, and a
+transcript ageing out is not meant to be a silent erasure. A visitor whose transcript was swept
+keeps their notes and simply stops being recognised until they escalate again.
+
+**The sweep needs the same scheduler** as conversation retention, and rides the same `beat`
+deployment. It runs at 03:45 UTC by default, fifteen minutes after the conversation sweep, and
+never shares its Redis lock — one key for two sweeps would let whichever ran first silently
+skip the other.
 
 ## Keeping spam out of the ticket queue
 

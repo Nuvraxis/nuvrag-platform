@@ -25,22 +25,24 @@ config.set_main_option(
 target_metadata = SQLModel.metadata
 
 
-# Partitions of `document_chunk`, created by migration 0008. They are ordinary tables to
-# reflection, so without this they read as six tables and a pile of indexes nobody declared.
-_PARTITION_PREFIX = "document_chunk_p"
+# Partitions of `document_chunk` (migration 0008) and `memory_entry` (0012). They are
+# ordinary tables to reflection, so without this each reads as several tables and a pile of
+# indexes nobody declared. Every partitioned table has to be listed here — a new one whose
+# prefix is missing makes `alembic check` demand its partitions be dropped.
+_PARTITION_PREFIXES = ("document_chunk_p", "memory_entry_p")
 
 
 def _include_object(obj, name: str, type_: str, reflected: bool, compare_to) -> bool:
     """Hide from autogenerate the objects it has no way to describe.
 
     Two kinds. pgvector's HNSW indexes are raw DDL — an opclass, build parameters, and since
-    0008 a cast expression, none of which SQLAlchemy can render. And `document_chunk`'s
-    partitions are a property of the parent table rather than models of their own, so
-    proposing to drop them would be proposing to drop the data.
+    0008 a cast expression, none of which SQLAlchemy can render. And a partition is a
+    property of its parent table rather than a model of its own, so proposing to drop one
+    would be proposing to drop the data.
     """
     if type_ == "index" and name and name.endswith("_embedding_hnsw"):
         return False
-    return not (reflected and name and name.startswith(_PARTITION_PREFIX))
+    return not (reflected and name and name.startswith(_PARTITION_PREFIXES))
 
 
 def _configure(connection: Connection | None = None, **kwargs) -> None:

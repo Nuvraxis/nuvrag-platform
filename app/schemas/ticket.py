@@ -3,7 +3,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from app.models import TicketPriority, TicketSource, TicketStatus
+from app.models import MemoryType, TicketPriority, TicketSource, TicketStatus
 from app.schemas.chat import MessageRead, session_id_field
 
 
@@ -56,11 +56,41 @@ class TicketRead(BaseModel):
     updated_at: datetime
 
 
+class MemoryNoteRead(BaseModel):
+    """One remembered note, as the dashboard is allowed to see it.
+
+    No `subject_id` and no `embedding`. The subject is the visitor's session id, which since
+    iteration 7 replays their transcript — a bearer capability has no business travelling in a
+    dashboard response, where it would reach browser history, error reports and screenshots.
+    Staff already read the transcript through the ticket itself.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    content: str
+    memory_type: MemoryType
+    created_at: datetime
+    last_referenced_at: datetime
+
+
+class VisitorMemory(BaseModel):
+    """What is remembered about the person who opened a ticket.
+
+    `total` is separate from `len(notes)` because the list is capped: a panel showing fifty of
+    two hundred notes with no way to say so would understate what is held about someone.
+    """
+
+    notes: list[MemoryNoteRead]
+    total: int
+
+
 class TicketDetail(BaseModel):
     """A ticket plus the conversation it wraps, which is where the thread actually lives."""
 
     ticket: TicketRead
     messages: list[MessageRead]
+    memory: VisitorMemory
 
 
 class TicketUpdate(BaseModel):

@@ -107,4 +107,8 @@ TENANT_SCOPED_TABLES = (
     "conversation",
     "message",
     "ticket",
+    # Partitioned, like `document_chunk`: the policy goes on the parent *and* on every
+    # partition, because a partition is a table a role could reach directly. Migration 0012
+    # does both.
+    "memory_entry",
 )

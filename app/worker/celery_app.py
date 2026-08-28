@@ -31,6 +31,9 @@ celery_app.conf.update(
         # bulk-uploading 50 PDFs cannot starve lightweight background work.
         "ingestion.*": {"queue": INGESTION_QUEUE},
         "maintenance.*": {"queue": DEFAULT_QUEUE},
+        # Explicit rather than left to `task_default_queue`, so that routing stays a
+        # statement about where this work belongs instead of a default nobody chose.
+        "nuvrag_mem.*": {"queue": DEFAULT_QUEUE},
     },
     task_acks_late=True,
     task_reject_on_worker_lost=True,
@@ -52,6 +55,7 @@ celery_app.conf.update(
 
 
 RETENTION_TASK = "maintenance.purge_expired_conversations"
+NUVRAG_MEM_PURGE_TASK = "nuvrag_mem.purge_expired_memory"
 
 # Read by `celery beat`, which is a **separate process from the worker** and must be a
 # singleton — two schedulers means every task fires twice. The chart runs it as its own
@@ -73,6 +77,19 @@ if settings.retention.enabled:
             # with it the stale ones are discarded and the next scheduled run does the work.
             "options": {"queue": DEFAULT_QUEUE, "expires": 60 * 60 * 6},
         }
+    }
+
+# Visitor memory has its own window, its own sweep and its own lock, and rides the same beat
+# deployment. Gated on `retention.enabled` as well as its own flag so that an operator who has
+# turned scheduled deletion off gets that for both kinds of data rather than one of them.
+if settings.retention.enabled and settings.nuvrag_mem.enabled:
+    celery_app.conf.beat_schedule["purge-expired-memory"] = {
+        "task": NUVRAG_MEM_PURGE_TASK,
+        "schedule": crontab(
+            hour=settings.nuvrag_mem.purge_hour_utc,
+            minute=settings.nuvrag_mem.purge_minute_utc,
+        ),
+        "options": {"queue": DEFAULT_QUEUE, "expires": 60 * 60 * 6},
     }
 
 

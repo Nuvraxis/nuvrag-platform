@@ -115,3 +115,20 @@ export async function replyToTicketAction(
     return fromError(error)
   }
 }
+
+export async function forgetVisitorMemoryAction(
+  _previous: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const ticketId = text(formData, 'ticket_id')
+  if (!ticketId) return failed('That ticket could not be identified.')
+
+  const api = await authenticatedApi()
+  try {
+    await api.forgetVisitorMemory(ticketId)
+    revalidatePath(detailPath(ticketId))
+    return succeeded('Everything remembered about this visitor has been deleted.')
+  } catch (error) {
+    return fromError(error)
+  }
+}

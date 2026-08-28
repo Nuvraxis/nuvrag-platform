@@ -13,6 +13,7 @@ from app.repositories.identity import (
     OrganizationRepository,
     UserRepository,
 )
+from app.repositories.memory_entry import MemoryEntryRepository, RetrievedMemory
 from app.repositories.ticket import TicketRepository
 
 __all__ = [
@@ -26,9 +27,11 @@ __all__ = [
     "DocumentChunkRepository",
     "DocumentRepository",
     "InvitationRepository",
+    "MemoryEntryRepository",
     "MessageRepository",
     "OrganizationRepository",
     "RetrievedChunk",
+    "RetrievedMemory",
     "TicketRepository",
     "UserRepository",
 ]

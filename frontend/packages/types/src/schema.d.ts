@@ -502,6 +502,34 @@ export interface paths {
         patch: operations["update_ticket_api_v1_tickets__ticket_id__patch"];
         trace?: never;
     };
+    "/api/v1/tickets/{ticket_id}/memory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Forget everything remembered about this ticket's visitor
+         * @description Irreversible, and the way an erasure request is honoured for visitor memory.
+         *
+         *     Admin or above, matching conversation and document deletion. Unlike the scheduled sweep it
+         *     steps over nothing: an open ticket does not hold a person's notes here, because somebody
+         *     has asked for this specific person to be forgotten and a request that quietly did nothing
+         *     would be worse than no request at all.
+         *
+         *     Keyed on the ticket rather than on the visitor's session id, which is a bearer capability
+         *     and therefore has no business in a URL — see `forget_ticket_visitor`.
+         */
+        delete: operations["forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/tickets/{ticket_id}/messages": {
         parameters: {
             query?: never;
@@ -764,6 +792,12 @@ export interface components {
             /** Name */
             name: string;
             /**
+             * Nuvrag Mem Retention Days
+             * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
+             * @default 30
+             */
+            nuvrag_mem_retention_days: number | null;
+            /**
              * Privacy Url
              * @description Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.
              * @default
@@ -814,6 +848,8 @@ export interface components {
             };
             /** Name */
             name: string;
+            /** Nuvrag Mem Retention Days */
+            nuvrag_mem_retention_days: number | null;
             /**
              * Org Id
              * Format: uuid
@@ -869,6 +905,11 @@ export interface components {
             model_config_json?: components["schemas"]["GenerationConfig"] | null;
             /** Name */
             name?: string | null;
+            /**
+             * Nuvrag Mem Retention Days
+             * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
+             */
+            nuvrag_mem_retention_days?: number | null;
             /** Privacy Url */
             privacy_url?: string | null;
             /**
@@ -1182,6 +1223,42 @@ export interface components {
             is_active?: boolean | null;
             role?: components["schemas"]["UserRole"] | null;
         };
+        /**
+         * MemoryNoteRead
+         * @description One remembered note, as the dashboard is allowed to see it.
+         *
+         *     No `subject_id` and no `embedding`. The subject is the visitor's session id, which since
+         *     iteration 7 replays their transcript — a bearer capability has no business travelling in a
+         *     dashboard response, where it would reach browser history, error reports and screenshots.
+         *     Staff already read the transcript through the ticket itself.
+         */
+        MemoryNoteRead: {
+            /** Content */
+            content: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Last Referenced At
+             * Format: date-time
+             */
+            last_referenced_at: string;
+            memory_type: components["schemas"]["MemoryType"];
+        };
+        /**
+         * MemoryType
+         * @description What kind of thing was remembered — a stated preference, a stable fact about them, or
+         *     situational context that made sense of a conversation.
+         * @enum {string}
+         */
+        MemoryType: "preference" | "fact" | "context";
         /** MessageRead */
         MessageRead: {
             /** Content */
@@ -1447,6 +1524,7 @@ export interface components {
          * @description A ticket plus the conversation it wraps, which is where the thread actually lives.
          */
         TicketDetail: {
+            memory: components["schemas"]["VisitorMemory"];
             /** Messages */
             messages: components["schemas"]["MessageRead"][];
             ticket: components["schemas"]["TicketRead"];
@@ -1598,6 +1676,19 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /**
+         * VisitorMemory
+         * @description What is remembered about the person who opened a ticket.
+         *
+         *     `total` is separate from `len(notes)` because the list is capped: a panel showing fifty of
+         *     two hundred notes with no way to say so would understate what is held about someone.
+         */
+        VisitorMemory: {
+            /** Notes */
+            notes: components["schemas"]["MemoryNoteRead"][];
+            /** Total */
+            total: number;
         };
         /**
          * WidgetBootstrap
@@ -2837,6 +2928,35 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TicketRead"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                ticket_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

@@ -375,6 +375,21 @@
             "title": "Name",
             "type": "string"
           },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": 30,
+            "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
+            "title": "Nuvrag Mem Retention Days"
+          },
           "privacy_url": {
             "default": "",
             "description": "Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.",
@@ -474,6 +489,17 @@
             "title": "Name",
             "type": "string"
           },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nuvrag Mem Retention Days"
+          },
           "org_id": {
             "format": "uuid",
             "title": "Org Id",
@@ -535,6 +561,7 @@
           "model_config_json",
           "theme_json",
           "retention_days",
+          "nuvrag_mem_retention_days",
           "privacy_url",
           "terms_url",
           "public_key",
@@ -625,6 +652,20 @@
               }
             ],
             "title": "Name"
+          },
+          "nuvrag_mem_retention_days": {
+            "anyOf": [
+              {
+                "maximum": 3650.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
+            "title": "Nuvrag Mem Retention Days"
           },
           "privacy_url": {
             "anyOf": [
@@ -1297,6 +1338,52 @@
         "title": "MemberUpdate",
         "type": "object"
       },
+      "MemoryNoteRead": {
+        "description": "One remembered note, as the dashboard is allowed to see it.\n\nNo `subject_id` and no `embedding`. The subject is the visitor's session id, which since\niteration 7 replays their transcript \u2014 a bearer capability has no business travelling in a\ndashboard response, where it would reach browser history, error reports and screenshots.\nStaff already read the transcript through the ticket itself.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_referenced_at": {
+            "format": "date-time",
+            "title": "Last Referenced At",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "memory_type",
+          "created_at",
+          "last_referenced_at"
+        ],
+        "title": "MemoryNoteRead",
+        "type": "object"
+      },
+      "MemoryType": {
+        "description": "What kind of thing was remembered \u2014 a stated preference, a stable fact about them, or\nsituational context that made sense of a conversation.",
+        "enum": [
+          "preference",
+          "fact",
+          "context"
+        ],
+        "title": "MemoryType",
+        "type": "string"
+      },
       "MessageRead": {
         "properties": {
           "content": {
@@ -1939,6 +2026,9 @@
       "TicketDetail": {
         "description": "A ticket plus the conversation it wraps, which is where the thread actually lives.",
         "properties": {
+          "memory": {
+            "$ref": "#/components/schemas/VisitorMemory"
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/MessageRead"
@@ -1952,7 +2042,8 @@
         },
         "required": [
           "ticket",
-          "messages"
+          "messages",
+          "memory"
         ],
         "title": "TicketDetail",
         "type": "object"
@@ -2296,6 +2387,28 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VisitorMemory": {
+        "description": "What is remembered about the person who opened a ticket.\n\n`total` is separate from `len(notes)` because the list is capped: a panel showing fifty of\ntwo hundred notes with no way to say so would understate what is held about someone.",
+        "properties": {
+          "notes": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryNoteRead"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "notes",
+          "total"
+        ],
+        "title": "VisitorMemory",
         "type": "object"
       },
       "WidgetBootstrap": {
@@ -4480,6 +4593,48 @@
           }
         ],
         "summary": "Update Ticket",
+        "tags": [
+          "tickets"
+        ]
+      }
+    },
+    "/api/v1/tickets/{ticket_id}/memory": {
+      "delete": {
+        "description": "Irreversible, and the way an erasure request is honoured for visitor memory.\n\nAdmin or above, matching conversation and document deletion. Unlike the scheduled sweep it\nsteps over nothing: an open ticket does not hold a person's notes here, because somebody\nhas asked for this specific person to be forgotten and a request that quietly did nothing\nwould be worse than no request at all.\n\nKeyed on the ticket rather than on the visitor's session id, which is a bearer capability\nand therefore has no business in a URL \u2014 see `forget_ticket_visitor`.",
+        "operationId": "forget_visitor_memory_api_v1_tickets__ticket_id__memory_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "ticket_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Ticket Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Forget everything remembered about this ticket's visitor",
         "tags": [
           "tickets"
         ]
