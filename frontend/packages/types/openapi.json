@@ -36,7 +36,7 @@
       },
       "AIConfigTest": {
         "additionalProperties": false,
-        "description": "An in-flight configuration, not necessarily the saved one.\n\nCredentials are optional for the same reason they are optional on a save: a test should\nexercise *what would be saved*, and for an omitted credential that is the one already\nstored. Requiring them here would mean re-typing a key that cannot be read back merely to\ncorrect a model name. The service resolves the fallback and only accepts it when the\nprovider still matches \u2014 a key stored for Azure proves nothing about Bedrock.",
+        "description": "An in-flight configuration, not necessarily the saved one.\n\nCredentials are optional for the same reason they are optional on a save: a test should\nexercise *what would be saved*, and for an omitted credential that is the one already\nstored. Requiring them here would mean re-typing a key that cannot be read back merely to\ncorrect a model name. The service resolves the fallback and only accepts it when the\nprovider still matches — a key stored for Azure proves nothing about Bedrock.",
         "properties": {
           "chat": {
             "anyOf": [
@@ -1018,7 +1018,7 @@
         "type": "object"
       },
       "EmbeddingProviderName": {
-        "description": "Anthropic is absent on purpose \u2014 it publishes no embeddings API.\n\nIts omission here is what the API's 422, the database check constraint and the factory's\ndispatch all derive from, so there is one place to change if that ever stops being true.",
+        "description": "Anthropic is absent on purpose — it publishes no embeddings API.\n\nIts omission here is what the API's 422, the database check constraint and the factory's\ndispatch all derive from, so there is one place to change if that ever stops being true.",
         "enum": [
           "azure",
           "bedrock",
@@ -1337,6 +1337,52 @@
         },
         "title": "MemberUpdate",
         "type": "object"
+      },
+      "MemoryNoteRead": {
+        "description": "One remembered note, as the dashboard is allowed to see it.\n\nNo `subject_id` and no `embedding`. The subject is the visitor's session id, which since\niteration 7 replays their transcript — a bearer capability has no business travelling in a\ndashboard response, where it would reach browser history, error reports and screenshots.\nStaff already read the transcript through the ticket itself.",
+        "properties": {
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "last_referenced_at": {
+            "format": "date-time",
+            "title": "Last Referenced At",
+            "type": "string"
+          },
+          "memory_type": {
+            "$ref": "#/components/schemas/MemoryType"
+          }
+        },
+        "required": [
+          "id",
+          "content",
+          "memory_type",
+          "created_at",
+          "last_referenced_at"
+        ],
+        "title": "MemoryNoteRead",
+        "type": "object"
+      },
+      "MemoryType": {
+        "description": "What kind of thing was remembered — a stated preference, a stable fact about them, or\nsituational context that made sense of a conversation.",
+        "enum": [
+          "preference",
+          "fact",
+          "context"
+        ],
+        "title": "MemoryType",
+        "type": "string"
       },
       "MessageRead": {
         "properties": {
@@ -1710,7 +1756,7 @@
       },
       "ProviderCredentials": {
         "additionalProperties": false,
-        "description": "Write-only, in the same sense the chatbot's secret key is: it goes in and never comes\nback out. Which members matter depends on the provider \u2014 see `registry.py`.",
+        "description": "Write-only, in the same sense the chatbot's secret key is: it goes in and never comes\nback out. Which members matter depends on the provider — see `registry.py`.",
         "properties": {
           "access_key_id": {
             "anyOf": [
@@ -1980,6 +2026,9 @@
       "TicketDetail": {
         "description": "A ticket plus the conversation it wraps, which is where the thread actually lives.",
         "properties": {
+          "memory": {
+            "$ref": "#/components/schemas/VisitorMemory"
+          },
           "messages": {
             "items": {
               "$ref": "#/components/schemas/MessageRead"
@@ -1993,7 +2042,8 @@
         },
         "required": [
           "ticket",
-          "messages"
+          "messages",
+          "memory"
         ],
         "title": "TicketDetail",
         "type": "object"
@@ -2339,6 +2389,28 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VisitorMemory": {
+        "description": "What is remembered about the person who opened a ticket.\n\n`total` is separate from `len(notes)` because the list is capped: a panel showing fifty of\ntwo hundred notes with no way to say so would understate what is held about someone.",
+        "properties": {
+          "notes": {
+            "items": {
+              "$ref": "#/components/schemas/MemoryNoteRead"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "notes",
+          "total"
+        ],
+        "title": "VisitorMemory",
+        "type": "object"
+      },
       "WidgetBootstrap": {
         "description": "Everything the widget needs to render before its first message.\n\n`name` and `greeting` are already resolved against the theme's overrides, so the widget\nrenders what it is given rather than deciding which of two sources wins.",
         "properties": {
@@ -2441,7 +2513,7 @@
         "type": "object"
       },
       "WidgetSessionState": {
-        "description": "What a returning visitor gets back when bootstrap is given their session id.\n\nThere is no outbound mail transport, so this is the only way a staff reply reaches the\nperson who asked for it: they open the widget again and it is in the log.\n\n`ticket_status` is the whole of what leaks about the ticket \u2014 not the address they gave,\nnot who it was assigned to, not its priority. Those belong to the organisation, and the\nsession id is a bearer capability rather than an authenticated identity.",
+        "description": "What a returning visitor gets back when bootstrap is given their session id.\n\nThere is no outbound mail transport, so this is the only way a staff reply reaches the\nperson who asked for it: they open the widget again and it is in the log.\n\n`ticket_status` is the whole of what leaks about the ticket — not the address they gave,\nnot who it was assigned to, not its priority. Those belong to the organisation, and the\nsession id is a bearer capability rather than an authenticated identity.",
         "properties": {
           "conversation_id": {
             "format": "uuid",
@@ -2475,7 +2547,7 @@
       },
       "WidgetTheme": {
         "additionalProperties": false,
-        "description": "How the widget looks on the tenant's site.\n\nEvery member is optional and only what was set is persisted. The widget applies these as\ninline custom properties over its own stylesheet, so an unset colour keeps the default \u2014\nincluding the automatic dark-mode switch \u2014 while a set one wins outright.\n\nSix digits of hex, no shorthand and no `rgb()`: the values are interpolated into a style\nattribute, and a narrow pattern is easier to be sure of than an escaping routine.",
+        "description": "How the widget looks on the tenant's site.\n\nEvery member is optional and only what was set is persisted. The widget applies these as\ninline custom properties over its own stylesheet, so an unset colour keeps the default —\nincluding the automatic dark-mode switch — while a set one wins outright.\n\nSix digits of hex, no shorthand and no `rgb()`: the values are interpolated into a style\nattribute, and a narrow pattern is easier to be sure of than an escaping routine.",
         "properties": {
           "accent": {
             "anyOf": [
@@ -3289,7 +3361,7 @@
     },
     "/api/v1/chatbots/{chatbot_id}/ai-config/test": {
       "post": {
-        "description": "Call the providers with values that have not been saved yet.\n\nAlways 200 \u2014 the verdict is in the body, because a provider rejecting a tenant's key is a\nresult this endpoint delivered successfully, not a failure of this endpoint.",
+        "description": "Call the providers with values that have not been saved yet.\n\nAlways 200 — the verdict is in the body, because a provider rejecting a tenant's key is a\nresult this endpoint delivered successfully, not a failure of this endpoint.",
         "operationId": "test_ai_config_api_v1_chatbots__chatbot_id__ai_config_test_post",
         "parameters": [
           {
@@ -3481,7 +3553,7 @@
     },
     "/api/v1/chatbots/{chatbot_id}/conversations/{conversation_id}": {
       "delete": {
-        "description": "Irreversible, and the way a single erasure request is honoured without waiting for\nthe retention sweep. Admin or above, matching document deletion \u2014 a transcript is the\ntenant's record of what their visitors asked.",
+        "description": "Irreversible, and the way a single erasure request is honoured without waiting for\nthe retention sweep. Admin or above, matching document deletion — a transcript is the\ntenant's record of what their visitors asked.",
         "operationId": "delete_conversation_api_v1_chatbots__chatbot_id__conversations__conversation_id__delete",
         "parameters": [
           {
@@ -4609,7 +4681,7 @@
     },
     "/public/widget/bootstrap": {
       "get": {
-        "description": "Called once when the widget iframe loads, before any message is sent.\n\nA visitor who opened a ticket comes back with their session id, and gets the transcript\nplus the ticket's status with it \u2014 there is no outbound mail, so reopening the widget is\nhow a staff reply reaches the person who asked for it.\n\nThe session id is a bearer capability, not an identity: it is 128 bits of browser-\ngenerated randomness, and it only means anything alongside the public key and an\nallow-listed origin that got this request past `WidgetSession` in the first place. It is\nrate-limited on the same buckets as chat so it cannot be used to sweep for live sessions.\n\nIt arrives as a **header rather than a query parameter** precisely because its job changed\nfrom labelling a conversation to granting read access to one. A query string is written to\ningress access logs (nginx's default `$request` includes it), kept in browser history, and\nhanded to third parties in `Referer`; a request header is in none of those places. The\nwidget already sends `X-Chatbot-Key` and `X-Widget-Site`, so this costs nothing new.",
+        "description": "Called once when the widget iframe loads, before any message is sent.\n\nA visitor who opened a ticket comes back with their session id, and gets the transcript\nplus the ticket's status with it — there is no outbound mail, so reopening the widget is\nhow a staff reply reaches the person who asked for it.\n\nThe session id is a bearer capability, not an identity: it is 128 bits of browser-\ngenerated randomness, and it only means anything alongside the public key and an\nallow-listed origin that got this request past `WidgetSession` in the first place. It is\nrate-limited on the same buckets as chat so it cannot be used to sweep for live sessions.\n\nIt arrives as a **header rather than a query parameter** precisely because its job changed\nfrom labelling a conversation to granting read access to one. A query string is written to\ningress access logs (nginx's default `$request` includes it), kept in browser history, and\nhanded to third parties in `Referer`; a request header is in none of those places. The\nwidget already sends `X-Chatbot-Key` and `X-Widget-Site`, so this costs nothing new.",
         "operationId": "bootstrap_public_widget_bootstrap_get",
         "parameters": [
           {
@@ -4796,7 +4868,7 @@
     },
     "/public/widget/tickets": {
       "post": {
-        "description": "Open a ticket from the widget's contact form.\n\nGoes through the same public-key + origin allow-list + rate-limit chain as `/chat`, and\nthen a second, tighter gate of its own. The shared chain is not enough here: none of the\npublic key, the origin or the session id is anything a script cannot present a fresh one\nof, so on their own they shape ordinary traffic rather than stopping deliberate abuse.\nThis endpoint is the one worth abusing \u2014 it writes a row carrying an address the caller\nchose and up to 4000 characters that a human then reads \u2014 so it is also keyed on the\nclient address, which a caller cannot simply pick.",
+        "description": "Open a ticket from the widget's contact form.\n\nGoes through the same public-key + origin allow-list + rate-limit chain as `/chat`, and\nthen a second, tighter gate of its own. The shared chain is not enough here: none of the\npublic key, the origin or the session id is anything a script cannot present a fresh one\nof, so on their own they shape ordinary traffic rather than stopping deliberate abuse.\nThis endpoint is the one worth abusing — it writes a row carrying an address the caller\nchose and up to 4000 characters that a human then reads — so it is also keyed on the\nclient address, which a caller cannot simply pick.",
         "operationId": "create_ticket_public_widget_tickets_post",
         "parameters": [
           {

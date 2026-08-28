@@ -101,11 +101,16 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
     # How long nuvrag_mem entries are kept, counted from `last_referenced_at`. NULL still
     # means forever, but unlike `retention_days` this starts at 30 — see the constant's note
     # for why the two neighbouring columns deliberately disagree.
-    nuvrag_mem_retention_days: int | None = Field(
-        default=NUVRAG_MEM_RETENTION_DEFAULT_DAYS,
-        nullable=True,
-        sa_column_kwargs={"server_default": str(NUVRAG_MEM_RETENTION_DEFAULT_DAYS)},
-    )
+    # No default of any kind here, deliberately — not a Python one and, since migration 0013,
+    # not a server one either. A column whose NULL is *meaningful* cannot carry a non-NULL
+    # default, because SQLAlchemy treats None at insert time as "nothing to say" and lets the
+    # default fill it in: a tenant who chose "keep visitor memory forever" while creating a
+    # chatbot silently got 30 days instead. `retention_days` next door is immune only because
+    # it never had a default to begin with.
+    #
+    # The 30 a new chatbot starts at lives in `ChatbotCreate` instead, which sends it as a
+    # value like any other. See `NUVRAG_MEM_RETENTION_DEFAULT_DAYS`.
+    nuvrag_mem_retention_days: int | None = Field(default=None, nullable=True)
 
     # Shown in the widget footer, above the branding. Deliberately *not* in `theme_json`:
     # "Reset to the default theme" empties that column outright, and quietly deleting a

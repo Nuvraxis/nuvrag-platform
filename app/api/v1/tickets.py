@@ -6,7 +6,14 @@ from app.api.deps import CurrentPrincipal, Pagination
 from app.models import TicketStatus
 from app.schemas.chat import MessageRead
 from app.schemas.common import Page
-from app.schemas.ticket import TicketDetail, TicketRead, TicketReply, TicketUpdate
+from app.schemas.ticket import (
+    MemoryNoteRead,
+    TicketDetail,
+    TicketRead,
+    TicketReply,
+    TicketUpdate,
+    VisitorMemory,
+)
 from app.services import ticket as ticket_service
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
@@ -39,10 +46,14 @@ async def list_tickets(
 
 @router.get("/{ticket_id}", response_model=TicketDetail)
 async def get_ticket(ticket_id: UUID, principal: CurrentPrincipal) -> TicketDetail:
-    ticket, messages = await ticket_service.get_ticket(principal.org_id, ticket_id)
+    view = await ticket_service.get_ticket(principal.org_id, ticket_id)
     return TicketDetail(
-        ticket=TicketRead.model_validate(ticket),
-        messages=[MessageRead.model_validate(message) for message in messages],
+        ticket=TicketRead.model_validate(view.ticket),
+        messages=[MessageRead.model_validate(message) for message in view.messages],
+        memory=VisitorMemory(
+            notes=[MemoryNoteRead.model_validate(note) for note in view.notes],
+            total=view.notes_total,
+        ),
     )
 
 

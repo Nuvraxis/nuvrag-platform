@@ -140,3 +140,20 @@ class MemoryEntryRepository(BaseRepository[MemoryEntry]):
             .values(last_referenced_at=now)
         )
         return int(result.rowcount or 0)
+
+    async def list_for_subject(
+        self, chatbot_id: UUID, subject_id: str, *, limit: int
+    ) -> list[MemoryEntry]:
+        """Everything known about one visitor, newest first.
+
+        Not `search` with a neutral vector: the dashboard panel has no question to be relevant
+        to, so ranking by distance would order a person's history by an accident of whatever
+        vector was passed in. Newest first is the order a human reads a history in.
+        """
+        result = await self.session.execute(
+            select(MemoryEntry)
+            .where(MemoryEntry.chatbot_id == chatbot_id, MemoryEntry.subject_id == subject_id)
+            .order_by(MemoryEntry.created_at.desc())
+            .limit(limit)
+        )
+        return list(result.scalars())

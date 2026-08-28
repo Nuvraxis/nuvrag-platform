@@ -117,24 +117,34 @@ export const RETENTION_MIN_DAYS = 1
 export const RETENTION_MAX_DAYS = 3650
 
 /**
- * Retention is the one number here whose *empty* value means something. Blank is "keep
- * transcripts forever" — the default, and not the same as zero, which the API and the
- * database both refuse precisely because it would read as "delete everything immediately".
- * `numeric` reports blank as missing, which is right for every other field and wrong for
- * this one.
+ * The two retention fields are the numbers here whose *empty* value means something. Blank is
+ * "keep this forever" — not the same as zero, which the API and the database both refuse
+ * precisely because it would read as "delete everything immediately". `numeric` reports blank
+ * as missing, which is right for every other field and wrong for these two.
+ *
+ * One builder rather than two hand-written schemas, so the pair cannot drift into validating
+ * differently. What they legitimately differ on is only their *default*, which lives in
+ * `chatbotDefaults` and not here.
  */
-const retentionDays = z
-  .union([z.number(), z.string()])
-  .transform((value) => (typeof value === 'string' ? value.trim() : value))
-  .refine((value) => value === '' || Number.isInteger(Number(value)), {
-    message: 'Enter a whole number of days, or leave it blank to keep conversations forever.',
-  })
-  .refine(
-    (value) =>
-      value === '' ||
-      (Number(value) >= RETENTION_MIN_DAYS && Number(value) <= RETENTION_MAX_DAYS),
-    { message: `Retention must be between ${RETENTION_MIN_DAYS} and ${RETENTION_MAX_DAYS} days.` },
-  )
+function blankableDays(label: string, blankMeans: string) {
+  return z
+    .union([z.number(), z.string()])
+    .transform((value) => (typeof value === 'string' ? value.trim() : value))
+    .refine((value) => value === '' || Number.isInteger(Number(value)), {
+      message: `Enter a whole number of days, or leave it blank to ${blankMeans}.`,
+    })
+    .refine(
+      (value) =>
+        value === '' ||
+        (Number(value) >= RETENTION_MIN_DAYS && Number(value) <= RETENTION_MAX_DAYS),
+      { message: `${label} must be between ${RETENTION_MIN_DAYS} and ${RETENTION_MAX_DAYS} days.` },
+    )
+}
+
+const retentionDays = blankableDays('Retention', 'keep conversations forever')
+
+/** Mirrors `NUVRAG_MEM_RETENTION_MIN_DAYS` / `_MAX_DAYS`, which are the same bounds. */
+const memoryRetentionDays = blankableDays('Memory retention', 'keep visitor memory forever')
 
 /**
  * One schema for both chatbot forms. They edit the same fields and only the settings form
@@ -157,6 +167,7 @@ export const chatbotSchema = z.object({
   top_k: numeric('Passages retrieved', 1, 20),
   min_similarity: numeric('Minimum similarity', 0, 1),
   retention_days: retentionDays,
+  nuvrag_mem_retention_days: memoryRetentionDays,
   status: z.enum(CHATBOT_STATUSES).optional(),
 })
 
@@ -174,19 +185,22 @@ const colour = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Use a six-digit hex colour
  * the parser's own reading of the scheme is what rejects `javascript:` and its obfuscations,
  * and a blocklist is a list of the ones somebody thought of.
  */
-const footerLink = z.string().max(500, 'Keep the link to 500 characters or fewer.').refine(
-  (value) => {
-    const link = value.trim()
-    if (!link) return true
-    try {
-      const parsed = new URL(link)
-      return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && !!parsed.host
-    } catch {
-      return false
-    }
-  },
-  { message: 'Enter a full address, like https://example.com/privacy.' },
-)
+const footerLink = z
+  .string()
+  .max(500, 'Keep the link to 500 characters or fewer.')
+  .refine(
+    (value) => {
+      const link = value.trim()
+      if (!link) return true
+      try {
+        const parsed = new URL(link)
+        return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && !!parsed.host
+      } catch {
+        return false
+      }
+    },
+    { message: 'Enter a full address, like https://example.com/privacy.' },
+  )
 
 export const widgetThemeSchema = z.object({
   accent: colour,

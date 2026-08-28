@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from uuid import UUID
 
 from app.core.exceptions import NotFoundError, ValidationError
@@ -13,6 +14,7 @@ from app.models import (
     TicketStatus,
     User,
 )
+from app.models.memory_entry import MemoryEntry
 from app.repositories import (
     ConversationRepository,
     MessageRepository,
@@ -20,6 +22,7 @@ from app.repositories import (
     UserRepository,
 )
 from app.schemas.ticket import TicketCreate, TicketUpdate
+from app.services.nuvrag_mem import notes_for_subject
 
 logger = get_logger(__name__)
 
@@ -31,6 +34,26 @@ SESSION_REPLAY_LIMIT = 100
 # Recorded on the ticket when the zero-chunk grounding-miss signal is what offered the
 # escalation, rather than the visitor asking unprompted.
 NO_GROUNDED_ANSWER = "no_grounded_answer"
+
+# How many remembered notes the detail page carries. A visitor is capped at
+# `NUVRAG_MEM_MAX_ENTRIES_PER_SUBJECT` rows, so this is a page rather than the lot — the total
+# travels with it so the panel can say which it is showing.
+MEMORY_PANEL_LIMIT = 50
+
+
+@dataclass(frozen=True, slots=True)
+class TicketView:
+    """Everything the detail page renders, gathered in one read transaction.
+
+    `notes` is deliberately not keyed by anything the caller could use to look the visitor up
+    again: the subject id is their session id, which is a bearer capability, and it has no
+    business in a dashboard response.
+    """
+
+    ticket: Ticket
+    messages: list[Message]
+    notes: list[MemoryEntry]
+    notes_total: int
 
 
 async def create_ticket(
@@ -133,14 +156,32 @@ async def list_tickets(
     return items, total
 
 
-async def get_ticket(org_id: UUID, ticket_id: UUID) -> tuple[Ticket, list[Message]]:
-    """The ticket and the conversation it wraps, which is where the thread lives."""
+async def get_ticket(org_id: UUID, ticket_id: UUID) -> TicketView:
+    """The ticket, the conversation it wraps, and what the assistant remembers about whoever
+    opened it.
+
+    All three in one read transaction. The memory is looked up by the conversation's session
+    id, which is the same `(chatbot_id, subject_id)` pair the chat path recalls on — a staff
+    member reading the ticket sees the material the assistant had, not a second version of it.
+    """
     async with tenant_session(org_id, readonly=True) as session:
         ticket = await _load(session, org_id, ticket_id)
         messages = await MessageRepository(session).list_for_conversation(
             ticket.conversation_id, limit=SESSION_REPLAY_LIMIT
         )
-    return ticket, messages
+
+        conversation = await ConversationRepository(session).get(ticket.conversation_id)
+        notes: list[MemoryEntry] = []
+        notes_total = 0
+        if conversation is not None:
+            notes, notes_total = await notes_for_subject(
+                session,
+                chatbot_id=ticket.chatbot_id,
+                subject_id=conversation.external_session_id,
+                limit=MEMORY_PANEL_LIMIT,
+            )
+
+    return TicketView(ticket=ticket, messages=messages, notes=notes, notes_total=notes_total)
 
 
 async def update_ticket(org_id: UUID, ticket_id: UUID, payload: TicketUpdate) -> Ticket:
@@ -283,8 +324,10 @@ def _apply_status(ticket: Ticket, status: TicketStatus) -> None:
 
 
 __all__ = [
+    "MEMORY_PANEL_LIMIT",
     "NO_GROUNDED_ANSWER",
     "SESSION_REPLAY_LIMIT",
+    "TicketView",
     "assign_ticket",
     "create_ticket",
     "get_ticket",

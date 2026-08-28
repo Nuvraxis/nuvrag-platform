@@ -92,9 +92,10 @@ export async function updateChatbotAction(
       system_prompt: text(formData, 'system_prompt'),
       allowed_origins: originList(formData, 'allowed_origins'),
       model_config_json: generationConfig(formData),
-      // Null here means "keep forever" rather than "unchanged" — the one field the API
-      // treats that way, and what makes retention something a tenant can switch back off.
+      // Null here means "keep forever" rather than "unchanged" — the two fields the API
+      // treats that way, and what makes either retention something a tenant can switch off.
       retention_days: retentionDays(formData),
+      nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
       status: chatbotStatus(formData, 'status'),
     })
   } catch (error) {

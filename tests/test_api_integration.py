@@ -3992,6 +3992,355 @@ class TestVisitorMemoryStaysAlive:
         assert await _referenced_at(org_id, chatbot["id"]) == refreshed
 
 
+# --------------------------------------------------- nuvrag_mem dashboard --
+
+
+async def _set_memory_retention(client: AsyncClient, token: str, chatbot_id: str, days):
+    response = await client.patch(
+        f"/api/v1/chatbots/{chatbot_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"nuvrag_mem_retention_days": days},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+class TestMemoryRetentionSetting:
+    """The second retention field. Same mechanism as the first, deliberately different
+    default, and the pair must not have merged into one behaviour."""
+
+    async def test_a_new_chatbot_starts_at_thirty_days_not_forever(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        # The contrast is the point: a transcript records one exchange, a note is a standing
+        # summary of a person across visits, so memory ships with a window and conversations
+        # do not.
+        assert chatbot["nuvrag_mem_retention_days"] == 30
+        assert chatbot["retention_days"] is None
+
+    async def test_the_column_carries_no_default_of_its_own(self, client):
+        """A column whose NULL means something must not have a non-NULL default.
+
+        The two say opposite things, and the disagreement is silent: SQLAlchemy treats a None
+        at insert time as "nothing to say" and lets a default fill it in. That is how the
+        create-time bug above happened, via the model's Python-side default. Migration 0013
+        removed the server-side one as well, so that neither the schema nor a psql session
+        claims new rows default to 30 — and so that anything reintroducing a default here has
+        this to fail against.
+        """
+        from app.db.session import system_session
+        from sqlalchemy import text as sql_text
+
+        async with system_session() as session:
+            defaults = await session.execute(
+                sql_text(
+                    "SELECT column_name, column_default FROM information_schema.columns "
+                    "WHERE table_name = 'chatbot' "
+                    "AND column_name IN ('retention_days', 'nuvrag_mem_retention_days')"
+                )
+            )
+            found = dict(defaults.all())
+
+        # Both retention columns, and neither of them defaults to anything.
+        assert found == {"retention_days": None, "nuvrag_mem_retention_days": None}, found
+
+    async def test_choosing_keep_forever_while_creating_is_honoured(self, client):
+        """A regression guard for a bug this iteration introduced and then removed.
+
+        `nuvrag_mem_retention_days` is the only column in this schema that both means
+        something as NULL and started life with a default. Those two cannot coexist:
+        SQLAlchemy treats `None` at insert time as "nothing to say" and lets the column
+        default fill it in, so a tenant clearing the field on the create form had their choice
+        replaced by 30 days — no error, nothing in a log, and only discoverable by patching
+        the chatbot afterwards. `retention_days` next door was never affected, and the only
+        reason is that it never had a default.
+
+        Both defaults are gone now — the Python one from the model, the server one in
+        migration 0013 — and the 30 a new chatbot starts at is sent explicitly by the schema.
+        """
+        token, _ = await _signup(client)
+
+        response = await client.post(
+            "/api/v1/chatbots",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "name": "Remembers forever",
+                "system_prompt": "",
+                "allowed_origins": [TENANT_ORIGIN],
+                "nuvrag_mem_retention_days": None,
+            },
+        )
+        assert response.status_code == 201, response.text
+        chatbot = response.json()["chatbot"]
+        assert chatbot["nuvrag_mem_retention_days"] is None
+
+        # Read back rather than trusting the create response, because the value that mattered
+        # was the one the INSERT actually wrote.
+        fetched = await client.get(
+            f"/api/v1/chatbots/{chatbot['id']}", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert fetched.json()["nuvrag_mem_retention_days"] is None
+
+    async def test_an_explicit_window_at_create_time_is_kept(self, client):
+        token, _ = await _signup(client)
+
+        response = await client.post(
+            "/api/v1/chatbots",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "name": "Ninety days",
+                "system_prompt": "",
+                "allowed_origins": [TENANT_ORIGIN],
+                "nuvrag_mem_retention_days": 90,
+            },
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["chatbot"]["nuvrag_mem_retention_days"] == 90
+
+    async def test_it_can_be_set_and_cleared_back_to_forever(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        set_to = await _set_memory_retention(client, token, chatbot["id"], 90)
+        assert set_to["nuvrag_mem_retention_days"] == 90
+        # `null` means "keep forever" here rather than "unchanged", which is the reinstatement
+        # `retention_days` needed too. Without it the field would be one-way.
+        cleared = await _set_memory_retention(client, token, chatbot["id"], None)
+        assert cleared["nuvrag_mem_retention_days"] is None
+
+    async def test_the_two_retentions_move_independently(self, client):
+        """Neither patch may drag the other along."""
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        after_memory = await _set_memory_retention(client, token, chatbot["id"], 7)
+        assert after_memory["retention_days"] is None
+
+        after_conversations = await _set_retention(client, token, chatbot["id"], 400)
+        assert after_conversations["nuvrag_mem_retention_days"] == 7
+        assert after_conversations["retention_days"] == 400
+
+    async def test_a_nonsense_window_is_refused(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        for days in (0, -5, 4000):
+            response = await client.patch(
+                f"/api/v1/chatbots/{chatbot['id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"nuvrag_mem_retention_days": days},
+            )
+            assert response.status_code == 422, (days, response.text)
+
+    async def test_the_database_refuses_it_too(self, client):
+        """The API bound is not the only guard, the same way it is not for conversations."""
+        from app.db.session import tenant_session
+        from sqlalchemy import text as sql_text
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        with pytest.raises(Exception) as caught:
+            async with tenant_session(uuid.UUID(org_id)) as session:
+                await session.execute(
+                    sql_text("UPDATE chatbot SET nuvrag_mem_retention_days = 0 WHERE id = :id"),
+                    {"id": uuid.UUID(chatbot["id"])},
+                )
+        assert "ck_chatbot_nuvrag_mem_retention_days" in str(caught.value)
+
+
+class TestTicketMemoryPanel:
+    """What the ticket detail page is given, and what it is deliberately not given."""
+
+    async def _detail(self, client, token, ticket_id: str) -> dict:
+        response = await client.get(
+            f"/api/v1/tickets/{ticket_id}", headers={"Authorization": f"Bearer {token}"}
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    async def test_a_ticket_carries_what_is_remembered_about_its_visitor(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        session_id = uuid.uuid4().hex
+        created = await _open_ticket(
+            client, chatbot["public_key"], session_id=session_id, message="Please email me."
+        )
+        report, _ = await _remember(
+            monkeypatch,
+            org_id,
+            created["conversation_id"],
+            _statements(("Prefers email over the phone", "preference")),
+        )
+        assert report.written == 1
+
+        memory = (await self._detail(client, token, created["ticket_id"]))["memory"]
+
+        assert memory["total"] == 1
+        assert [note["content"] for note in memory["notes"]] == ["Prefers email over the phone"]
+        assert memory["notes"][0]["memory_type"] == "preference"
+        assert memory["notes"][0]["created_at"] and memory["notes"][0]["last_referenced_at"]
+
+    async def test_the_response_never_carries_the_visitors_session_id(self, client, monkeypatch):
+        """The subject of a note is the visitor's session id, which since iteration 7 replays
+        their transcript. A bearer capability must not travel in a dashboard response, where
+        it would reach browser history, screenshots and error reports."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        session_id = uuid.uuid4().hex
+        created = await _open_ticket(
+            client, chatbot["public_key"], session_id=session_id, message="Please email me."
+        )
+        await _remember(
+            monkeypatch,
+            org_id,
+            created["conversation_id"],
+            _statements(("Prefers email over the phone", "preference")),
+        )
+
+        raw = json.dumps(await self._detail(client, token, created["ticket_id"]))
+        assert session_id not in raw
+        assert "subject_id" not in raw
+        assert "embedding" not in raw
+
+    async def test_a_ticket_with_nothing_remembered_reports_an_empty_panel(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        created = await _open_ticket(client, chatbot["public_key"], message="Hello")
+
+        memory = (await self._detail(client, token, created["ticket_id"]))["memory"]
+        assert memory == {"notes": [], "total": 0}
+
+    async def test_the_panel_shows_notes_the_chat_path_would_not_recall(self, client, monkeypatch):
+        """No similarity floor here: staff are entitled to see everything held about a person,
+        including notes too weak to have been recalled for any particular question."""
+        from app.db.session import tenant_session
+        from app.services.nuvrag_mem import recall
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        session_id = uuid.uuid4().hex
+        created = await _open_ticket(
+            client, chatbot["public_key"], session_id=session_id, message="Hello"
+        )
+        await _remember(
+            monkeypatch,
+            org_id,
+            created["conversation_id"],
+            _statements(("Runs the EU West region", "fact")),
+        )
+
+        # Nothing this note would answer, so the chat path recalls none of it.
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            assert (
+                await recall(
+                    session,
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    subject_id=session_id,
+                    embedding=_hash_embedding("totally different wording", 768),
+                    dimension=768,
+                )
+                == []
+            )
+
+        memory = (await self._detail(client, token, created["ticket_id"]))["memory"]
+        assert [note["content"] for note in memory["notes"]] == ["Runs the EU West region"]
+
+    async def test_a_long_history_is_capped_and_says_so(self, client, monkeypatch):
+        from app.services import ticket as ticket_service
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        monkeypatch.setattr(ticket_service, "MEMORY_PANEL_LIMIT", 2)
+
+        session_id = uuid.uuid4().hex
+        created = await _open_ticket(
+            client, chatbot["public_key"], session_id=session_id, message="Hello"
+        )
+        await _remember(
+            monkeypatch,
+            org_id,
+            created["conversation_id"],
+            _statements(("alpha note", "fact"), ("bravo note", "fact"), ("charlie note", "fact")),
+        )
+
+        memory = (await self._detail(client, token, created["ticket_id"]))["memory"]
+        # The count is the whole history even though the list is a page of it — a panel that
+        # showed two of three with no way to say so would understate what is held.
+        assert memory["total"] == 3
+        assert len(memory["notes"]) == 2
+
+    async def test_a_panel_shows_only_its_own_visitor_and_its_own_chatbot(
+        self, client, monkeypatch
+    ):
+        """`(chatbot_id, subject_id)` is the whole scope of a panel, and both halves matter.
+
+        One tenant, two chatbots, two visitors — so neither RLS nor the ticket lookup is doing
+        the work here. A visitor talking to a company's support bot and its sales bot with the
+        same session id is the collision the chatbot half prevents; two people on one bot is
+        the collision the subject half prevents.
+        """
+        token, org_id = await _signup(client)
+        support = (await _create_chatbot(client, token, name="Support Bot"))["chatbot"]
+        sales = (await _create_chatbot(client, token, name="Sales Bot"))["chatbot"]
+        await _configure_ai(client, token, support["id"])
+        await _configure_ai(client, token, sales["id"])
+
+        shared_session = uuid.uuid4().hex
+        other_session = uuid.uuid4().hex
+
+        async def _ticket_with(chatbot, session_id: str, note: str) -> str:
+            created = await _open_ticket(
+                client, chatbot["public_key"], session_id=session_id, message="Hello"
+            )
+            report, _ = await _remember(
+                monkeypatch, org_id, created["conversation_id"], _statements((note, "fact"))
+            )
+            assert report.written == 1
+            return created["ticket_id"]
+
+        on_support = await _ticket_with(support, shared_session, "Told the support bot")
+        on_sales = await _ticket_with(sales, shared_session, "Told the sales bot")
+        someone_else = await _ticket_with(support, other_session, "Told it by someone else")
+
+        async def _contents(ticket_id: str) -> list[str]:
+            detail = await self._detail(client, token, ticket_id)
+            return [note["content"] for note in detail["memory"]["notes"]]
+
+        assert await _contents(on_support) == ["Told the support bot"]
+        assert await _contents(on_sales) == ["Told the sales bot"]
+        assert await _contents(someone_else) == ["Told it by someone else"]
+
+    async def test_another_organisation_cannot_read_the_panel(self, client, monkeypatch):
+        token_a, org_a = await _signup(client)
+        chatbot_a = (await _create_chatbot(client, token_a))["chatbot"]
+        await _configure_ai(client, token_a, chatbot_a["id"])
+        created = await _open_ticket(
+            client, chatbot_a["public_key"], session_id=uuid.uuid4().hex, message="Please email me."
+        )
+        await _remember(
+            monkeypatch,
+            org_a,
+            created["conversation_id"],
+            _statements(("Prefers email over the phone", "preference")),
+        )
+
+        token_b, _ = await _signup(client)
+        response = await client.get(
+            f"/api/v1/tickets/{created['ticket_id']}",
+            headers={"Authorization": f"Bearer {token_b}"},
+        )
+        assert response.status_code == 404, response.text
+
+
 @pytest.mark.skipif(
     _OLLAMA is None,
     reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",

@@ -11,7 +11,12 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.repositories import MemoryEntryRepository, RetrievedMemory, TicketRepository
+from app.models import MemoryEntry
+from app.repositories import (
+    MemoryEntryRepository,
+    RetrievedMemory,
+    TicketRepository,
+)
 
 
 async def recall(
@@ -45,4 +50,24 @@ async def recall(
         dimension=dimension,
         top_k=config.retrieval_top_k,
         min_similarity=config.retrieval_min_similarity,
+    )
+
+
+async def notes_for_subject(
+    session: AsyncSession, *, chatbot_id: UUID, subject_id: str, limit: int
+) -> tuple[list[MemoryEntry], int]:
+    """What is remembered about one visitor, and how much of it there is.
+
+    For the dashboard rather than for a prompt, so there is no similarity floor and no ticket
+    gate: a staff member reading a ticket is entitled to see what the assistant was working
+    from, including notes too weak to have been recalled for any particular question. The
+    tenant scoping is the same as everywhere else — RLS, plus `chatbot_id` in the predicate.
+
+    The count is returned alongside because the list is capped: a panel that silently showed
+    the first fifty of two hundred would misrepresent what is held about a person.
+    """
+    repo = MemoryEntryRepository(session)
+    return (
+        await repo.list_for_subject(chatbot_id, subject_id, limit=limit),
+        await repo.count_for_subject(chatbot_id, subject_id),
     )

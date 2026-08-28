@@ -32,7 +32,7 @@ async function TicketDetail({ params }: { params: Promise<{ ticketId: string }> 
     fetchApi((api) => api.getTicket(ticketId)),
     fetchApi((api) => api.listMembers()),
   ])
-  const { ticket, messages } = detail
+  const { ticket, messages, memory } = detail
 
   const assignee = ticket.assigned_to
     ? team.members.find((member) => member.id === ticket.assigned_to)
@@ -159,6 +159,47 @@ async function TicketDetail({ params }: { params: Promise<{ ticketId: string }> 
               This ticket was opened without a message.
             </p>
           ) : null}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>What we remember about this visitor</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-muted-foreground text-sm">
+            Short notes taken from what this visitor said on earlier visits, and given to the
+            assistant when they come back. Read-only here — how long they are kept is set per
+            chatbot on its settings tab.
+          </p>
+
+          {memory.total === 0 ? (
+            <p className="text-muted-foreground text-sm">
+              Nothing yet. Notes are only taken for visitors who have asked for a human, and only
+              once the chatbot has embedded something.
+            </p>
+          ) : (
+            <>
+              <ul className="space-y-2">
+                {memory.notes.map((note) => (
+                  <li key={note.id} className="border-border rounded-md border px-3 py-2 text-sm">
+                    <div className="text-muted-foreground flex flex-wrap items-center gap-2 text-xs">
+                      <Badge variant="outline">{note.memory_type}</Badge>
+                      <span>learned {formatDateTime(note.created_at)}</span>
+                      <span>· last used {formatDateTime(note.last_referenced_at)}</span>
+                    </div>
+                    <p className="text-foreground mt-1 whitespace-pre-wrap">{note.content}</p>
+                  </li>
+                ))}
+              </ul>
+
+              {memory.total > memory.notes.length ? (
+                <p className="text-muted-foreground text-xs">
+                  Showing the {memory.notes.length} most recent of {memory.total}.
+                </p>
+              ) : null}
+            </>
+          )}
         </CardContent>
       </Card>
 
