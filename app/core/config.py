@@ -267,6 +267,25 @@ class NuvragMemSettings(BaseSettings):
     lock_ttl_seconds: int = Field(default=3600, ge=60)
 
 
+class UsageCapSettings(BaseSettings):
+    """What happens when the counters cannot be read, and nothing else.
+
+    *How much* a chatbot may spend is per chatbot — `monthly_ingestion_unit_cap` and
+    `monthly_retrieval_call_cap` — for the same reason retention's duration is: the budget
+    belongs to whoever runs the providers for that bot. What is here is the one judgement an
+    operator might reasonably want to make differently.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="USAGE_CAP_", env_file=".env", extra="ignore")
+
+    # Fail open, matching the rate limiter. If Postgres cannot be reached the cap status is
+    # unknown, and a transient blip silencing every widget on the platform is worse than a
+    # bounded amount of uncounted spend during it — bounded because the outage that hid the
+    # counters is also stopping most of the work. An operator who would rather stop spending
+    # than keep answering flips this, and both enforcement points honour it identically.
+    fail_closed: bool = False
+
+
 class RateLimitSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RATE_LIMIT_", env_file=".env", extra="ignore")
 
@@ -323,6 +342,7 @@ class Settings(BaseSettings):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     nuvrag_mem: NuvragMemSettings = Field(default_factory=NuvragMemSettings)
+    usage_cap: UsageCapSettings = Field(default_factory=UsageCapSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 

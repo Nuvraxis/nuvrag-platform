@@ -369,6 +369,34 @@
           "model_config_json": {
             "$ref": "#/components/schemas/GenerationConfig"
           },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.",
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Retrieval rounds allowed per UTC calendar month \u2014 one per answered chat turn. Null is unlimited, which is the default.",
+            "title": "Monthly Retrieval Call Cap"
+          },
           "name": {
             "maxLength": 200,
             "minLength": 1,
@@ -426,6 +454,12 @@
           },
           "theme_json": {
             "$ref": "#/components/schemas/WidgetTheme"
+          },
+          "usage_cap_message": {
+            "default": "Sorry \u2014 I can't answer questions right now. Please try again later, or ask for a human if you need help sooner.",
+            "maxLength": 1000,
+            "title": "Usage Cap Message",
+            "type": "string"
           }
         },
         "required": [
@@ -484,6 +518,28 @@
             "additionalProperties": true,
             "title": "Model Config Json",
             "type": "object"
+          },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Retrieval Call Cap"
           },
           "name": {
             "title": "Name",
@@ -548,6 +604,20 @@
             "format": "date-time",
             "title": "Updated At",
             "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsagePeriodRead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usage_cap_message": {
+            "title": "Usage Cap Message",
+            "type": "string"
           }
         },
         "required": [
@@ -562,6 +632,9 @@
           "theme_json",
           "retention_days",
           "nuvrag_mem_retention_days",
+          "monthly_ingestion_unit_cap",
+          "monthly_retrieval_call_cap",
+          "usage_cap_message",
           "privacy_url",
           "terms_url",
           "public_key",
@@ -639,6 +712,34 @@
                 "type": "null"
               }
             ]
+          },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.",
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Retrieval rounds allowed per UTC calendar month \u2014 one per answered chat turn. Null is unlimited, which is the default.",
+            "title": "Monthly Retrieval Call Cap"
           },
           "name": {
             "anyOf": [
@@ -736,6 +837,18 @@
                 "type": "null"
               }
             ]
+          },
+          "usage_cap_message": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Cap Message"
           }
         },
         "title": "ChatbotUpdate",
@@ -2288,6 +2401,31 @@
         "title": "TokenPair",
         "type": "object"
       },
+      "UsagePeriodRead": {
+        "description": "This month's running totals. Absent until the month's first charge.",
+        "properties": {
+          "ingestion_units_used": {
+            "title": "Ingestion Units Used",
+            "type": "integer"
+          },
+          "period_start": {
+            "format": "date",
+            "title": "Period Start",
+            "type": "string"
+          },
+          "retrieval_calls_used": {
+            "title": "Retrieval Calls Used",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "period_start",
+          "ingestion_units_used",
+          "retrieval_calls_used"
+        ],
+        "title": "UsagePeriodRead",
+        "type": "object"
+      },
       "UserRead": {
         "properties": {
           "created_at": {
@@ -3149,6 +3287,7 @@
         ]
       },
       "get": {
+        "description": "The detail view, which is the only place `usage` is populated \u2014 the list endpoint\nwould need one lookup per row to do the same.",
         "operationId": "get_chatbot_api_v1_chatbots__chatbot_id__get",
         "parameters": [
           {
@@ -3771,7 +3910,7 @@
         ]
       },
       "post": {
-        "description": "Accepted immediately; parsing and embedding happen on the ingestion worker.",
+        "description": "Accepted immediately; parsing and embedding happen on the ingestion worker.\n\nAnswers 429 when the chatbot has spent its monthly ingestion allowance, with the current\ntotal and the ceiling in `details` so the dashboard can say which it is.",
         "operationId": "upload_document_api_v1_chatbots__chatbot_id__documents_post",
         "parameters": [
           {

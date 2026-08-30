@@ -53,7 +53,7 @@ export function ChatbotSettingsForm({ chatbot }: { chatbot: Chatbot }) {
               </Alert>
             ) : null}
 
-            <ChatbotFields control={form.control} />
+            <ChatbotFields control={form.control} usage={chatbot.usage} />
 
             <FormField
               control={form.control}

@@ -1,6 +1,7 @@
 from app.models.base import TENANT_SCOPED_TABLES
 from app.models.chatbot import DEFAULT_GENERATION_CONFIG, Chatbot
 from app.models.chatbot_ai_config import PARTITIONED_EMBEDDING_DIMENSIONS, ChatbotAIConfig
+from app.models.chatbot_usage_period import ChatbotUsagePeriod
 from app.models.conversation import Conversation, Message
 from app.models.document import Document
 from app.models.document_chunk import DocumentChunk
@@ -34,6 +35,7 @@ __all__ = [
     "Chatbot",
     "ChatbotAIConfig",
     "ChatbotStatus",
+    "ChatbotUsagePeriod",
     "Conversation",
     "Document",
     "DocumentChunk",

@@ -27,6 +27,8 @@ def _serialise(chatbot: Chatbot) -> str:
             "privacy_url": chatbot.privacy_url,
             "terms_url": chatbot.terms_url,
             "status": str(chatbot.status),
+            "monthly_retrieval_call_cap": chatbot.monthly_retrieval_call_cap,
+            "usage_cap_message": chatbot.usage_cap_message,
         }
     )
 

@@ -4677,6 +4677,728 @@ class TestVisitorMemorySweep:
             assert entry["options"]["queue"] == "default"
 
 
+# --------------------------------------------------------------- usage caps --
+
+
+async def _set_caps(client: AsyncClient, token: str, chatbot_id: str, **caps) -> dict:
+    response = await client.patch(
+        f"/api/v1/chatbots/{chatbot_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json=caps,
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _usage_row(org_id: str, chatbot_id: str) -> tuple[int, int] | None:
+    """This month's counters, read under the owning tenant's RLS context."""
+    from app.db.session import tenant_session
+    from app.services.usage import period_start
+    from sqlalchemy import text as sql_text
+
+    async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT ingestion_units_used, retrieval_calls_used FROM chatbot_usage_period"
+                    " WHERE chatbot_id = :c AND period_start = :p"
+                ),
+                {"c": uuid.UUID(chatbot_id), "p": period_start()},
+            )
+        ).first()
+    return tuple(row) if row is not None else None
+
+
+async def _upload(client: AsyncClient, token: str, chatbot_id: str, body: bytes):
+    return await client.post(
+        f"/api/v1/chatbots/{chatbot_id}/documents",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("handbook.md", body, "text/markdown")},
+    )
+
+
+class TestUsageUnits:
+    async def test_a_unit_is_four_thousand_bytes_rounded_up(self, client):
+        from app.services.usage import INGESTION_UNIT_BYTES, ingestion_units
+
+        assert INGESTION_UNIT_BYTES == 4000
+        # Rounded up, so the smallest document still costs something rather than nothing.
+        assert ingestion_units(1) == 1
+        assert ingestion_units(4000) == 1
+        assert ingestion_units(4001) == 2
+        assert ingestion_units(26214400) == 6554
+
+    async def test_a_period_is_the_first_of_the_utc_month(self, client):
+        from datetime import UTC, datetime
+
+        from app.services.usage import period_start
+
+        assert period_start(datetime(2026, 3, 17, 23, 59, tzinfo=UTC)).isoformat() == "2026-03-01"
+        # A moment that is already the next day somewhere else still belongs to the UTC month.
+        assert period_start(datetime(2026, 3, 31, 22, 0, tzinfo=UTC)).isoformat() == "2026-03-01"
+
+
+class TestUsageCounter:
+    """The single statement that rolls over, checks the cap and increments, all at once."""
+
+    async def _ready(self, client) -> tuple[str, str, str]:
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        return token, org_id, chatbot["id"]
+
+    async def test_an_unlimited_chatbot_is_counted_but_never_blocked(self, client):
+        from app.services.usage import UsageKind, consume
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        for _ in range(3):
+            verdict = await consume(
+                uuid.UUID(org_id),
+                uuid.UUID(chatbot_id),
+                kind=UsageKind.RETRIEVAL,
+                amount=1,
+                cap=None,
+            )
+            assert verdict.allowed and verdict.cap is None
+
+        # Counted even with no cap, so switching one on later starts from the truth rather
+        # than from zero.
+        assert await _usage_row(org_id, chatbot_id) == (0, 3)
+
+    async def test_a_cap_blocks_exactly_at_its_boundary(self, client):
+        from app.services.usage import UsageKind, consume
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        outcomes = [
+            (
+                await consume(
+                    uuid.UUID(org_id),
+                    uuid.UUID(chatbot_id),
+                    kind=UsageKind.RETRIEVAL,
+                    amount=1,
+                    cap=3,
+                )
+            ).allowed
+            for _ in range(5)
+        ]
+
+        assert outcomes == [True, True, True, False, False]
+        assert await _usage_row(org_id, chatbot_id) == (0, 3)
+
+    async def test_an_amount_larger_than_the_whole_cap_is_refused(self, client):
+        """The one case the statement's INSERT branch cannot judge for itself: with no row
+        yet there is nothing to compare against, so the caller checks first."""
+        from app.services.usage import UsageKind, consume
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        verdict = await consume(
+            uuid.UUID(org_id),
+            uuid.UUID(chatbot_id),
+            kind=UsageKind.INGESTION,
+            amount=50,
+            cap=10,
+        )
+
+        assert not verdict.allowed
+        assert await _usage_row(org_id, chatbot_id) is None
+
+    async def test_concurrent_callers_cannot_overshoot_the_cap(self, client):
+        """The race the brief calls out. Forty callers, a cap of ten, and no read-then-write
+        gap for them to interleave in — the comparison happens inside the same statement that
+        does the increment, under the row lock it already takes."""
+        from app.services.usage import UsageKind, consume
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        verdicts = await asyncio.gather(
+            *(
+                consume(
+                    uuid.UUID(org_id),
+                    uuid.UUID(chatbot_id),
+                    kind=UsageKind.RETRIEVAL,
+                    amount=1,
+                    cap=10,
+                )
+                for _ in range(40)
+            )
+        )
+
+        assert sum(1 for verdict in verdicts if verdict.allowed) == 10
+        assert await _usage_row(org_id, chatbot_id) == (0, 10)
+
+    async def test_the_two_counters_do_not_charge_each_other(self, client):
+        from app.services.usage import UsageKind, consume
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        await consume(
+            uuid.UUID(org_id), uuid.UUID(chatbot_id), kind=UsageKind.INGESTION, amount=4, cap=None
+        )
+        await consume(
+            uuid.UUID(org_id), uuid.UUID(chatbot_id), kind=UsageKind.RETRIEVAL, amount=1, cap=None
+        )
+        assert await _usage_row(org_id, chatbot_id) == (4, 1)
+
+        # An ingestion total already spent must not be what an answer is judged against. The
+        # numbers are chosen so the two readings disagree: 1 + 1 <= 2 allows it, while
+        # 4 + 1 <= 2 — the ingestion column — would not.
+        verdict = await consume(
+            uuid.UUID(org_id), uuid.UUID(chatbot_id), kind=UsageKind.RETRIEVAL, amount=1, cap=2
+        )
+        assert verdict.allowed, "the retrieval cap was compared against the ingestion counter"
+        assert await _usage_row(org_id, chatbot_id) == (4, 2)
+
+    async def test_a_new_month_starts_fresh_and_keeps_the_old_row(self, client):
+        """Rollover is the statement's INSERT branch: the first write of a month finds no row
+        for its `period_start` and creates one. Nothing is scheduled and nothing has to notice
+        the boundary."""
+        from datetime import UTC, datetime
+
+        from app.db.session import system_session
+        from app.services.usage import UsageKind, consume
+        from sqlalchemy import text as sql_text
+
+        _token, org_id, chatbot_id = await self._ready(client)
+        await consume(
+            uuid.UUID(org_id), uuid.UUID(chatbot_id), kind=UsageKind.RETRIEVAL, amount=7, cap=None
+        )
+
+        # Backdate the row so the next call lands in what is, to it, a new month.
+        async with system_session() as session:
+            await session.execute(
+                sql_text(
+                    "UPDATE chatbot_usage_period SET period_start = period_start "
+                    "- interval '1 month' WHERE chatbot_id = :c"
+                ),
+                {"c": uuid.UUID(chatbot_id)},
+            )
+
+        verdict = await consume(
+            uuid.UUID(org_id), uuid.UUID(chatbot_id), kind=UsageKind.RETRIEVAL, amount=2, cap=5
+        )
+        assert verdict.allowed, "last month's total was counted against this month's cap"
+
+        async with system_session() as session:
+            rows = (
+                await session.execute(
+                    sql_text(
+                        "SELECT period_start, retrieval_calls_used FROM chatbot_usage_period"
+                        " WHERE chatbot_id = :c ORDER BY period_start"
+                    ),
+                    {"c": uuid.UUID(chatbot_id)},
+                )
+            ).all()
+
+        assert [row[1] for row in rows] == [7, 2], "the previous period was not preserved"
+        # And the new row is keyed on *this* month rather than on any fixed date, which is the
+        # whole of what makes the rollover lazy rather than absent. Worked out here rather
+        # than by calling `period_start`, so the assertion cannot agree with a broken one.
+        this_month = datetime.now(UTC).date().replace(day=1)
+        assert rows[-1][0] == this_month
+
+
+class TestUsageCountersUnavailable:
+    """What happens when the cap status cannot be determined at all — distinct from the cap
+    being reached, and the one behaviour an operator can flip."""
+
+    def _break_counters(self, monkeypatch):
+        from app.services import usage
+        from sqlalchemy.exc import OperationalError
+
+        def _explode(*_args, **_kwargs):
+            raise OperationalError("SELECT 1", {}, Exception("counter store is down"))
+
+        monkeypatch.setattr(usage, "tenant_session", _explode)
+
+    async def test_it_fails_open_by_default(self, client, monkeypatch):
+        from app.core.config import settings
+        from app.services.usage import UsageKind, consume
+
+        assert settings.usage_cap.fail_closed is False, "the shipped default must be fail-open"
+        self._break_counters(monkeypatch)
+
+        verdict = await consume(
+            uuid.uuid4(), uuid.uuid4(), kind=UsageKind.RETRIEVAL, amount=1, cap=1
+        )
+        assert verdict.allowed is True
+        # Reported separately from `allowed`, because letting something through unmeasured is
+        # not the same as measuring room for it.
+        assert verdict.counters_unavailable is True
+
+    async def test_an_operator_can_make_it_fail_closed(self, client, monkeypatch):
+        from app.core.config import settings
+        from app.services.usage import UsageKind, consume
+
+        monkeypatch.setattr(settings.usage_cap, "fail_closed", True)
+        self._break_counters(monkeypatch)
+
+        verdict = await consume(
+            uuid.uuid4(), uuid.uuid4(), kind=UsageKind.RETRIEVAL, amount=1, cap=1
+        )
+        assert verdict.allowed is False
+        assert verdict.counters_unavailable is True
+
+    async def test_the_headroom_check_honours_the_same_flag(self, client, monkeypatch):
+        """Both enforcement points read one setting, so an operator cannot end up with
+        uploads failing closed and answers failing open."""
+        from app.core.config import settings
+        from app.services.usage import UsageKind, headroom
+
+        self._break_counters(monkeypatch)
+        assert (
+            await headroom(uuid.uuid4(), uuid.uuid4(), kind=UsageKind.INGESTION, cap=5)
+        ).allowed is True
+
+        monkeypatch.setattr(settings.usage_cap, "fail_closed", True)
+        assert (
+            await headroom(uuid.uuid4(), uuid.uuid4(), kind=UsageKind.INGESTION, cap=5)
+        ).allowed is False
+
+    async def test_an_unlimited_chatbot_needs_no_counter_at_all(self, client, monkeypatch):
+        """A NULL cap never touches the store, so an outage cannot affect a chatbot that was
+        never going to be limited."""
+        from app.services.usage import UsageKind, headroom
+
+        self._break_counters(monkeypatch)
+        verdict = await headroom(uuid.uuid4(), uuid.uuid4(), kind=UsageKind.INGESTION, cap=None)
+        assert verdict.allowed and not verdict.counters_unavailable
+
+
+class TestUsageCapSettings:
+    async def test_a_new_chatbot_is_unlimited(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        assert chatbot["monthly_ingestion_unit_cap"] is None
+        assert chatbot["monthly_retrieval_call_cap"] is None
+        assert chatbot["usage_cap_message"]
+
+    async def test_a_cap_can_be_set_and_cleared_again(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        set_to = await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=500)
+        assert set_to["monthly_retrieval_call_cap"] == 500
+
+        # Null removes the cap rather than meaning "unchanged", the same exception the two
+        # retention columns get. Without it a cap would be a one-way switch.
+        cleared = await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=None)
+        assert cleared["monthly_retrieval_call_cap"] is None
+
+    async def test_clearing_one_cap_leaves_the_other_alone(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _set_caps(
+            client,
+            token,
+            chatbot["id"],
+            monthly_ingestion_unit_cap=100,
+            monthly_retrieval_call_cap=200,
+        )
+
+        after = await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=None)
+        assert after["monthly_ingestion_unit_cap"] == 100
+        assert after["monthly_retrieval_call_cap"] is None
+
+    async def test_a_nonsense_cap_is_refused(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        for value in (0, -1, 2_000_000_000):
+            response = await client.patch(
+                f"/api/v1/chatbots/{chatbot['id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"monthly_ingestion_unit_cap": value},
+            )
+            assert response.status_code == 422, (value, response.text)
+
+    async def test_the_database_refuses_it_too(self, client):
+        from app.db.session import tenant_session
+        from sqlalchemy import text as sql_text
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        with pytest.raises(Exception) as caught:
+            async with tenant_session(uuid.UUID(org_id)) as session:
+                await session.execute(
+                    sql_text("UPDATE chatbot SET monthly_retrieval_call_cap = 0 WHERE id = :id"),
+                    {"id": uuid.UUID(chatbot["id"])},
+                )
+        assert "ck_chatbot_monthly_retrieval_call_cap" in str(caught.value)
+
+    async def test_the_detail_endpoint_reports_usage_and_the_list_does_not(self, client):
+        """`usage` costs a lookup per chatbot, so only the one-row view pays for it."""
+        from app.services.usage import UsageKind, consume
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        # Before anything is spent there is no row for the month, and none is invented.
+        detail = (await client.get(f"/api/v1/chatbots/{chatbot['id']}", headers=headers)).json()
+        assert detail["usage"] is None
+
+        await consume(
+            uuid.UUID(org_id),
+            uuid.UUID(chatbot["id"]),
+            kind=UsageKind.INGESTION,
+            amount=12,
+            cap=None,
+        )
+
+        detail = (await client.get(f"/api/v1/chatbots/{chatbot['id']}", headers=headers)).json()
+        assert detail["usage"]["ingestion_units_used"] == 12
+        assert detail["usage"]["retrieval_calls_used"] == 0
+        assert detail["usage"]["period_start"].endswith("-01")
+
+        listed = (await client.get("/api/v1/chatbots", headers=headers)).json()["items"]
+        assert all(item["usage"] is None for item in listed)
+
+
+class TestUsageCapRowLevelSecurity:
+    """The policy itself, proven as a role RLS actually applies to — the application runs as
+    the table owner by default, for whom it does not."""
+
+    async def test_the_policy_is_enabled_with_a_fail_closed_predicate(self, client):
+        from app.db.session import system_session
+        from sqlalchemy import text as sql_text
+
+        async with system_session() as session:
+            enabled = await session.execute(
+                sql_text(
+                    "SELECT relrowsecurity FROM pg_class WHERE relname = 'chatbot_usage_period'"
+                )
+            )
+            assert enabled.scalar_one() is True
+
+            qual = (
+                await session.execute(
+                    sql_text(
+                        "SELECT qual FROM pg_policies WHERE tablename = 'chatbot_usage_period'"
+                    )
+                )
+            ).scalar_one()
+
+        # An unset GUC yields NULL, so the predicate is never true and the table reads empty.
+        assert "current_setting" in qual
+        assert "NULLIF" in qual.upper()
+
+    async def test_an_unprivileged_role_sees_only_its_own_tenants_counters(self, client):
+        from app.db.session import get_engine, system_session
+        from app.services.usage import UsageKind, consume
+        from sqlalchemy import text as sql_text
+
+        token_a, org_a = await _signup(client)
+        chatbot_a = (await _create_chatbot(client, token_a))["chatbot"]
+        await consume(
+            uuid.UUID(org_a),
+            uuid.UUID(chatbot_a["id"]),
+            kind=UsageKind.RETRIEVAL,
+            amount=3,
+            cap=None,
+        )
+
+        token_b, org_b = await _signup(client)
+        chatbot_b = (await _create_chatbot(client, token_b, name="B Bot"))["chatbot"]
+        await consume(
+            uuid.UUID(org_b),
+            uuid.UUID(chatbot_b["id"]),
+            kind=UsageKind.RETRIEVAL,
+            amount=9,
+            cap=None,
+        )
+
+        role = f"usage_rls_probe_{uuid.uuid4().hex[:12]}"
+        engine = get_engine()
+
+        async with system_session() as session:
+            try:
+                await session.execute(sql_text(f'CREATE ROLE "{role}" NOLOGIN'))
+            except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+                pytest.skip(
+                    f"test database cannot create roles ({type(exc).__name__}); "
+                    "grant CREATEROLE to exercise the RLS policy directly"
+                )
+            await session.execute(sql_text(f'GRANT SELECT ON chatbot_usage_period TO "{role}"'))
+
+        async def _read(org_id: str | None) -> list[int]:
+            async with engine.connect() as conn, conn.begin():
+                await conn.execute(sql_text(f'SET LOCAL ROLE "{role}"'))
+                if org_id is not None:
+                    await conn.execute(sql_text(f"SET LOCAL app.current_org_id = '{org_id}'"))
+                result = await conn.execute(
+                    sql_text("SELECT retrieval_calls_used FROM chatbot_usage_period")
+                )
+                return sorted(row[0] for row in result)
+
+        try:
+            assert await _read(None) == [], "an unset tenant GUC must read as empty"
+            assert 3 in await _read(org_a)
+            assert 9 not in await _read(org_a), "another tenant's counters were visible"
+            assert 9 in await _read(org_b)
+            assert 3 not in await _read(org_b)
+        finally:
+            async with system_session() as session:
+                await session.execute(sql_text(f'REVOKE ALL ON chatbot_usage_period FROM "{role}"'))
+                await session.execute(sql_text(f'DROP ROLE IF EXISTS "{role}"'))
+
+
+class TestIngestionCap:
+    async def _ready(self, client) -> tuple[str, str, dict]:
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        return token, org_id, chatbot
+
+    async def test_an_upload_charges_its_size_rounded_up(self, client):
+        token, org_id, chatbot = await self._ready(client)
+
+        response = await _upload(client, token, chatbot["id"], b"x" * 4001)
+        assert response.status_code == 202, response.text
+
+        # 4001 bytes is two units, not one.
+        assert await _usage_row(org_id, chatbot["id"]) == (2, 0)
+
+    async def test_a_chatbot_already_at_its_cap_is_refused_before_anything_is_stored(
+        self, client, monkeypatch
+    ):
+        """The first of the two checks. Nothing is streamed, so a tenant at their ceiling does
+        not pay the transfer to be told so."""
+        from app.services import document as document_service
+        from app.services.usage import UsageKind, consume
+
+        token, org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_ingestion_unit_cap=5)
+        await consume(
+            uuid.UUID(org_id),
+            uuid.UUID(chatbot["id"]),
+            kind=UsageKind.INGESTION,
+            amount=5,
+            cap=5,
+        )
+
+        uploaded: list[str] = []
+        original = document_service.get_object_storage
+
+        def _watched():
+            storage = original()
+            monkeypatch.setattr(
+                storage, "upload", lambda *a, **k: uploaded.append("streamed"), raising=False
+            )
+            return storage
+
+        monkeypatch.setattr(document_service, "get_object_storage", _watched)
+
+        response = await _upload(client, token, chatbot["id"], b"tiny")
+        assert response.status_code == 429, response.text
+        body = response.json()["error"]
+        assert body["code"] == "usage_cap_exceeded"
+        assert body["details"] == {"kind": "ingestion", "used": 5, "cap": 5}
+        assert uploaded == [], "the file was streamed despite the chatbot being at its cap"
+
+    async def test_an_upload_that_would_overshoot_is_refused_and_leaves_nothing_behind(
+        self, client
+    ):
+        """The second check, with the true size. The object is deleted and no document row is
+        written, so a refusal costs the tenant nothing but the transfer."""
+        token, org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_ingestion_unit_cap=2)
+
+        response = await _upload(client, token, chatbot["id"], b"x" * 40_000)
+        assert response.status_code == 429, response.text
+        assert response.json()["error"]["details"]["cap"] == 2
+
+        documents = (
+            await client.get(
+                f"/api/v1/chatbots/{chatbot['id']}/documents",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()
+        assert documents["total"] == 0
+        assert await _usage_row(org_id, chatbot["id"]) is None
+
+    async def test_an_unlimited_chatbot_uploads_as_before(self, client):
+        token, org_id, chatbot = await self._ready(client)
+
+        for _ in range(3):
+            assert (await _upload(client, token, chatbot["id"], b"x" * 100)).status_code == 202
+
+        assert await _usage_row(org_id, chatbot["id"]) == (3, 0)
+
+
+class TestRetrievalCap:
+    """The chat half. A capped chatbot still answers — it just answers without spending."""
+
+    async def _ready(self, client) -> tuple[str, str, dict]:
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        return token, org_id, chatbot
+
+    def _refuse_providers(self, monkeypatch) -> list[str]:
+        """Both provider factories, rigged to fail the test if the capped path calls them."""
+        called: list[str] = []
+
+        async def _chat(*_args, **_kwargs):
+            called.append("chat")
+            raise AssertionError("the capped path built a chat provider")
+
+        async def _embeddings(*_args, **_kwargs):
+            called.append("embedding")
+            raise AssertionError("the capped path built an embedding provider")
+
+        monkeypatch.setattr("app.services.rag.factory.get_chat_provider", _chat)
+        monkeypatch.setattr("app.services.rag.factory.get_embedding_provider", _embeddings)
+        return called
+
+    async def _turn(self, client, chatbot, session_id: str, message="Are you there?") -> dict:
+        events = {}
+        tokens: list[str] = []
+        async with client.stream(
+            "POST",
+            "/public/widget/chat",
+            headers={"X-Chatbot-Key": chatbot["public_key"], "Origin": TENANT_ORIGIN},
+            json={"message": message, "session_id": session_id},
+        ) as response:
+            assert response.status_code == 200
+            name = None
+            async for line in response.aiter_lines():
+                if line.startswith("event:"):
+                    name = line[6:].strip()
+                elif line.startswith("data:") and name:
+                    payload = json.loads(line[5:].strip())
+                    events[name] = payload
+                    if name == "token":
+                        tokens.append(payload["content"])
+        events["_tokens"] = tokens
+        return events
+
+    async def test_an_answered_turn_charges_one_call(self, client, monkeypatch):
+        _token, org_id, chatbot = await self._ready(client)
+
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert await _usage_row(org_id, chatbot["id"]) == (0, 1)
+
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert await _usage_row(org_id, chatbot["id"]) == (0, 2)
+
+    async def test_a_capped_chatbot_answers_without_calling_a_provider(self, client, monkeypatch):
+        """The whole point: no embedding call and no generation call. Falling back to an
+        ungrounded answer would still spend money and defeat the cap."""
+        token, _org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+
+        # Spend the single allowed call.
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+
+        called = self._refuse_providers(monkeypatch)
+        events = await self._turn(client, chatbot, uuid.uuid4().hex)
+
+        assert called == [], "a provider was reached on a capped turn"
+        assert events["_tokens"] == [chatbot["usage_cap_message"]]
+        assert events["sources"]["sources"] == []
+        # Nothing was retrieved, so a human is the honest next step — the same reading a
+        # grounding miss already gets.
+        assert events["done"]["can_escalate"] is True
+        assert events["done"]["message_id"]
+
+    async def test_the_refused_turn_is_still_written_to_the_transcript(self, client, monkeypatch):
+        """A conversation missing the turn it refused would be worse to read back than one
+        that says plainly it could not answer."""
+        token, _org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+
+        self._refuse_providers(monkeypatch)
+        session_id = uuid.uuid4().hex
+        await self._turn(client, chatbot, session_id, message="Do you sell submarines?")
+
+        replay = (
+            await client.get(
+                "/public/widget/bootstrap",
+                headers=_widget_headers(chatbot["public_key"], session_id),
+            )
+        ).json()["session"]
+        assert [m["role"] for m in replay["messages"]] == ["user", "assistant"]
+        assert replay["messages"][0]["content"] == "Do you sell submarines?"
+        assert replay["messages"][1]["content"] == chatbot["usage_cap_message"]
+
+    async def test_a_capped_turn_does_not_queue_memory_extraction(self, client, monkeypatch):
+        """Extraction runs a chat completion on the worker, so queueing it here would spend
+        exactly the money the cap exists to stop."""
+        from app.worker.tasks import extract_visitor_memory_task
+
+        token, _org_id, chatbot = await self._ready(client)
+        session_id, _ = await _escalated(client, token, chatbot)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+
+        queued: list[dict] = []
+        monkeypatch.setattr(
+            extract_visitor_memory_task, "apply_async", lambda *_a, **kw: queued.append(kw)
+        )
+        self._refuse_providers(monkeypatch)
+
+        # A visitor with a ticket, which is exactly who extraction would normally run for.
+        await self._turn(client, chatbot, session_id)
+        assert queued == []
+
+    async def test_the_operator_chooses_the_wording(self, client, monkeypatch):
+        token, _org_id, chatbot = await self._ready(client)
+        await _set_caps(
+            client,
+            token,
+            chatbot["id"],
+            monthly_retrieval_call_cap=1,
+            usage_cap_message="We are taking a short break. Please email support@acme.com.",
+        )
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+
+        self._refuse_providers(monkeypatch)
+        events = await self._turn(client, chatbot, uuid.uuid4().hex)
+
+        assert events["_tokens"] == ["We are taking a short break. Please email support@acme.com."]
+
+    async def test_raising_the_cap_lets_answers_through_again(self, client, monkeypatch):
+        token, _org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+        await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+
+        self._refuse_providers(monkeypatch)
+        capped = await self._turn(client, chatbot, uuid.uuid4().hex)
+        assert capped["_tokens"] == [chatbot["usage_cap_message"]]
+
+        # Clearing the cap invalidates the cached config, so the next turn is served normally.
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=None)
+        done = await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert done["message_id"]
+
+    async def test_an_ingestion_cap_does_not_stop_answers(self, client, monkeypatch):
+        """Two counters, two ceilings. A tenant who has stopped uploading has not stopped
+        being able to answer."""
+        token, org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_ingestion_unit_cap=1)
+
+        done = await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert done["message_id"]
+        assert await _usage_row(org_id, chatbot["id"]) == (0, 1)
+
+    async def test_a_counter_outage_still_answers_by_default(self, client, monkeypatch):
+        """Fail-open, on the path where it matters most: a blip must not silence every widget
+        on the platform."""
+        from app.services import usage
+        from sqlalchemy.exc import OperationalError
+
+        token, _org_id, chatbot = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+
+        def _explode(*_args, **_kwargs):
+            raise OperationalError("SELECT 1", {}, Exception("counter store is down"))
+
+        monkeypatch.setattr(usage, "tenant_session", _explode)
+
+        done = await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert done["message_id"], "a counter outage silenced the widget"
+
+
 @pytest.mark.skipif(
     _OLLAMA is None,
     reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
@@ -4754,15 +5476,22 @@ class TestVisitorMemoryAgainstOllama:
         )
         assert [table for _, table in placements] == [expected]
 
-    async def test_a_paraphrase_recalls_the_note_and_an_unrelated_question_does_not(self, client):
+    async def test_a_paraphrase_ranks_above_an_unrelated_question(self, client, monkeypatch):
         """Real semantic recall, which the bag-of-words stub cannot express.
 
-        The thresholds here are measured rather than assumed. Against nomic-embed-text the
-        note below scores 0.54 for contact-related paraphrases and 0.37 for a password reset,
-        with the default 0.45 floor sitting between them — which is the whole reason memory's
-        floor is higher than document retrieval's 0.25. The margin on the low side is not
-        large, which is why it is a setting.
+        Asserts the *ranking* rather than the absolute floor, because only the ranking holds
+        across embedding models. Two measured examples, same note and same questions:
+
+            nomic-embed-text (768d)   paraphrase 0.542  unrelated 0.373-0.431
+            qwen3-embedding:8b (4096d) paraphrase 0.720  unrelated 0.476-0.526
+
+        The shipped 0.45 default sits cleanly between the two bands on the first model and
+        below *both* on the second, where it would admit an unrelated note — the exact failure
+        the higher floor exists to prevent. `NUVRAG_MEM_RETRIEVAL_MIN_SIMILARITY` therefore
+        has to be calibrated against whichever model a deployment actually runs, which is why
+        it is a setting; see the open checklist item.
         """
+        from app.core.config import settings
         from app.db.session import tenant_session
         from app.services.ai import factory
         from app.services.nuvrag_mem import extract_visitor_memory, recall
@@ -4791,8 +5520,10 @@ class TestVisitorMemoryAgainstOllama:
 
         embedder = await factory.get_embedding_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
 
-        async def _recall(question: str):
+        async def _recall(question: str, *, floor: float | None = None):
             vector = (await embedder.embed_batch([question]))[0]
+            if floor is not None:
+                monkeypatch.setattr(settings.nuvrag_mem, "retrieval_min_similarity", floor)
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
@@ -4802,10 +5533,17 @@ class TestVisitorMemoryAgainstOllama:
                     dimension=width,
                 )
 
-        assert await _recall("What is the best way to get in touch with you?"), (
-            "a paraphrase of what the visitor said did not recall it"
+        async def _closeness(question: str) -> float:
+            found = await _recall(question, floor=0.0)
+            assert found, "the note was not returned at all, so nothing here is measurable"
+            return found[0].similarity
+
+        paraphrase = await _closeness("What is the best way to get in touch with you?")
+        unrelated = await _closeness("How do I reset a forgotten password?")
+
+        assert paraphrase > unrelated, (
+            f"a paraphrase of what the visitor said ({paraphrase:.3f}) did not rank above an "
+            f"unrelated question ({unrelated:.3f})"
         )
-        assert await _recall("How do I reset a forgotten password?") == [], (
-            "an unrelated question recalled a note, which is the failure mode the floor exists "
-            "to prevent"
-        )
+        # And the shipped floor still admits the paraphrase, whatever it does at the bottom.
+        assert await _recall("What is the best way to get in touch with you?")

@@ -65,6 +65,21 @@ class RateLimitExceededError(DomainError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class UsageCapExceededError(DomainError):
+    """A monthly spend ceiling, not a rate limit.
+
+    Shares 429 with `RateLimitExceededError` because it is the same class of answer — come
+    back later — but carries no `Retry-After`: the wait is until the calendar turns over, not
+    a number of seconds, and a header promising otherwise would be a lie a client acts on.
+    """
+
+    status_code = 429
+    code = "usage_cap_exceeded"
+
+    def __init__(self, message: str, *, kind: str, used: int, cap: int | None) -> None:
+        super().__init__(message, details={"kind": kind, "used": used, "cap": cap})
+
+
 class PayloadTooLargeError(DomainError):
     status_code = 413
     code = "payload_too_large"

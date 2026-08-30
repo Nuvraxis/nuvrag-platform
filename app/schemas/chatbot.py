@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
@@ -7,13 +7,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ChatbotStatus
 from app.models.chatbot import (
+    DEFAULT_USAGE_CAP_MESSAGE,
     LINK_MAX_LENGTH,
     NUVRAG_MEM_RETENTION_DEFAULT_DAYS,
     NUVRAG_MEM_RETENTION_MAX_DAYS,
     NUVRAG_MEM_RETENTION_MIN_DAYS,
     RETENTION_MAX_DAYS,
     RETENTION_MIN_DAYS,
+    USAGE_CAP_MAX,
+    USAGE_CAP_MESSAGE_MAX_LENGTH,
+    USAGE_CAP_MIN,
 )
+from app.services.usage import INGESTION_UNIT_BYTES
 
 
 def validate_link(value: str) -> str:
@@ -141,6 +146,34 @@ class WidgetTheme(BaseModel):
     greeting: str | None = Field(default=None, max_length=300)
 
 
+USAGE_CAP_DESCRIPTIONS = {
+    "monthly_ingestion_unit_cap": (
+        "Ingestion units allowed per UTC calendar month, where one unit is "
+        f"{INGESTION_UNIT_BYTES} bytes of uploaded document, rounded up. Null is unlimited, "
+        "which is the default."
+    ),
+    "monthly_retrieval_call_cap": (
+        "Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null "
+        "is unlimited, which is the default."
+    ),
+}
+
+
+def usage_cap_field(column: str) -> Any:
+    """Null means unlimited on both models, so neither carries a non-null default.
+
+    On create that is the value a chatbot starts at; on patch it is also the instruction to
+    remove a cap, which is why `update_chatbot` reinstates it after `exclude_none` — the same
+    treatment the two retention columns need, for the same reason.
+    """
+    return Field(
+        default=None,
+        ge=USAGE_CAP_MIN,
+        le=USAGE_CAP_MAX,
+        description=USAGE_CAP_DESCRIPTIONS[column],
+    )
+
+
 class GenerationConfig(BaseModel):
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=64, le=8192)
@@ -159,6 +192,11 @@ class ChatbotCreate(BaseModel):
     theme_json: WidgetTheme = Field(default_factory=WidgetTheme)
     retention_days: int | None = retention_field()
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field()
+    monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
+    monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
+    usage_cap_message: str = Field(
+        default=DEFAULT_USAGE_CAP_MESSAGE, max_length=USAGE_CAP_MESSAGE_MAX_LENGTH
+    )
     privacy_url: str = link_field(PRIVACY_DESCRIPTION)
     terms_url: str = link_field(TERMS_DESCRIPTION)
 
@@ -190,6 +228,12 @@ class ChatbotUpdate(BaseModel):
     # Same treatment, same reason: null here is "keep memory forever", so it is
     # reinstated after `exclude_none` when the caller actually named it.
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field(default=None)
+    # And again: null here removes a cap rather than leaving it alone.
+    monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
+    monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
+    # Not reinstated, because null means nothing here — the column is not nullable, so an
+    # omitted message is simply unchanged.
+    usage_cap_message: str | None = Field(default=None, max_length=USAGE_CAP_MESSAGE_MAX_LENGTH)
     # `None` is "unchanged" and `""` is "remove the link", the same split as `description`.
     privacy_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
     terms_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
@@ -207,6 +251,16 @@ class ChatbotUpdate(BaseModel):
         return None if value is None else validate_link(value)
 
 
+class UsagePeriodRead(BaseModel):
+    """This month's running totals. Absent until the month's first charge."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    period_start: date
+    ingestion_units_used: int
+    retrieval_calls_used: int
+
+
 class ChatbotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
 
@@ -221,6 +275,12 @@ class ChatbotRead(BaseModel):
     theme_json: dict[str, Any]
     retention_days: int | None
     nuvrag_mem_retention_days: int | None
+    monthly_ingestion_unit_cap: int | None
+    monthly_retrieval_call_cap: int | None
+    usage_cap_message: str
+    # Filled in by the detail endpoint only. The list endpoint leaves it null rather than
+    # paying for a usage lookup per row, which is the N+1 this field would otherwise be.
+    usage: UsagePeriodRead | None = None
     privacy_url: str
     terms_url: str
     public_key: str

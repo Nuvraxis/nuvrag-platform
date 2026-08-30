@@ -158,7 +158,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Chatbot */
+        /**
+         * Get Chatbot
+         * @description The detail view, which is the only place `usage` is populated — the list endpoint
+         *     would need one lookup per row to do the same.
+         */
         get: operations["get_chatbot_api_v1_chatbots__chatbot_id__get"];
         put?: never;
         post?: never;
@@ -311,6 +315,9 @@ export interface paths {
         /**
          * Upload a document for ingestion
          * @description Accepted immediately; parsing and embedding happen on the ingestion worker.
+         *
+         *     Answers 429 when the chatbot has spent its monthly ingestion allowance, with the current
+         *     total and the ceiling in `details` so the dashboard can say which it is.
          */
         post: operations["upload_document_api_v1_chatbots__chatbot_id__documents_post"];
         delete?: never;
@@ -789,6 +796,16 @@ export interface components {
             /** Description */
             description?: string | null;
             model_config_json?: components["schemas"]["GenerationConfig"];
+            /**
+             * Monthly Ingestion Unit Cap
+             * @description Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.
+             */
+            monthly_ingestion_unit_cap?: number | null;
+            /**
+             * Monthly Retrieval Call Cap
+             * @description Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null is unlimited, which is the default.
+             */
+            monthly_retrieval_call_cap?: number | null;
             /** Name */
             name: string;
             /**
@@ -820,6 +837,11 @@ export interface components {
              */
             terms_url: string;
             theme_json?: components["schemas"]["WidgetTheme"];
+            /**
+             * Usage Cap Message
+             * @default Sorry — I can't answer questions right now. Please try again later, or ask for a human if you need help sooner.
+             */
+            usage_cap_message: string;
         };
         /** ChatbotCreateResponse */
         ChatbotCreateResponse: {
@@ -846,6 +868,10 @@ export interface components {
             model_config_json: {
                 [key: string]: unknown;
             };
+            /** Monthly Ingestion Unit Cap */
+            monthly_ingestion_unit_cap: number | null;
+            /** Monthly Retrieval Call Cap */
+            monthly_retrieval_call_cap: number | null;
             /** Name */
             name: string;
             /** Nuvrag Mem Retention Days */
@@ -877,6 +903,9 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+            usage?: components["schemas"]["UsagePeriodRead"] | null;
+            /** Usage Cap Message */
+            usage_cap_message: string;
         };
         /**
          * ChatbotSecret
@@ -903,6 +932,16 @@ export interface components {
             /** Description */
             description?: string | null;
             model_config_json?: components["schemas"]["GenerationConfig"] | null;
+            /**
+             * Monthly Ingestion Unit Cap
+             * @description Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.
+             */
+            monthly_ingestion_unit_cap?: number | null;
+            /**
+             * Monthly Retrieval Call Cap
+             * @description Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null is unlimited, which is the default.
+             */
+            monthly_retrieval_call_cap?: number | null;
             /** Name */
             name?: string | null;
             /**
@@ -923,6 +962,8 @@ export interface components {
             /** Terms Url */
             terms_url?: string | null;
             theme_json?: components["schemas"]["WidgetTheme"] | null;
+            /** Usage Cap Message */
+            usage_cap_message?: string | null;
         };
         /** ComponentHealth */
         ComponentHealth: {
@@ -1633,6 +1674,21 @@ export interface components {
              * @default bearer
              */
             token_type: string;
+        };
+        /**
+         * UsagePeriodRead
+         * @description This month's running totals. Absent until the month's first charge.
+         */
+        UsagePeriodRead: {
+            /** Ingestion Units Used */
+            ingestion_units_used: number;
+            /**
+             * Period Start
+             * Format: date
+             */
+            period_start: string;
+            /** Retrieval Calls Used */
+            retrieval_calls_used: number;
         };
         /** UserRead */
         UserRead: {

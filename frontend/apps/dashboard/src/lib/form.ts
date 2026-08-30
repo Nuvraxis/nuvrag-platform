@@ -72,3 +72,15 @@ export function generationConfig(formData: FormData): GenerationConfig {
     min_similarity: number(formData, 'min_similarity', 0.25),
   }
 }
+
+/**
+ * Blank means "no ceiling", which is a value rather than a missing one — the same spelling as
+ * `retentionDays`, and the API reinstates a null cap for the same reason it reinstates a null
+ * retention. Both caps start unset, so absent and blank do mean the same thing here.
+ */
+export function usageCap(formData: FormData, name: string): number | null {
+  const raw = text(formData, name)
+  if (!raw) return null
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? Math.round(parsed) : null
+}

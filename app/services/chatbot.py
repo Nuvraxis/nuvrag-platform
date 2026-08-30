@@ -7,9 +7,10 @@ from app.core.exceptions import NotFoundError
 from app.core.security import generate_public_key, generate_secret_key, hash_api_key
 from app.core.slug import randomised_slug, slugify, unique_slug
 from app.db.session import tenant_session
-from app.models import Chatbot, ChatbotStatus
+from app.models import Chatbot, ChatbotStatus, ChatbotUsagePeriod
 from app.repositories import ChatbotRepository
 from app.schemas.chatbot import ChatbotCreate, ChatbotUpdate, EmbedSnippet
+from app.services import usage
 from app.services.cache import ChatbotConfigCache
 from app.services.redis_client import get_redis
 
@@ -34,6 +35,9 @@ def _build(org_id: UUID, payload: ChatbotCreate, slug: str, secret_key: str) -> 
         theme_json=payload.theme_json.model_dump(exclude_none=True),
         retention_days=payload.retention_days,
         nuvrag_mem_retention_days=payload.nuvrag_mem_retention_days,
+        monthly_ingestion_unit_cap=payload.monthly_ingestion_unit_cap,
+        monthly_retrieval_call_cap=payload.monthly_retrieval_call_cap,
+        usage_cap_message=payload.usage_cap_message,
         privacy_url=payload.privacy_url,
         terms_url=payload.terms_url,
         public_key=generate_public_key(settings.environment),
@@ -91,16 +95,28 @@ async def get_chatbot(org_id: UUID, chatbot_id: UUID) -> Chatbot:
     return chatbot
 
 
+async def current_usage(org_id: UUID, chatbot_id: UUID) -> ChatbotUsagePeriod | None:
+    """This month's counters, or None before the month's first charge."""
+    async with tenant_session(org_id, readonly=True) as session:
+        return await usage.current_period(session, chatbot_id)
+
+
 async def update_chatbot(org_id: UUID, chatbot_id: UUID, payload: ChatbotUpdate) -> Chatbot:
     updates = payload.model_dump(exclude_unset=True, exclude_none=True)
 
     # `exclude_none` is what makes this a partial patch, and it is right for every field
-    # whose null means "leave it alone". The two retention columns are the exceptions: null
-    # there is the value meaning "keep forever", and dropping it would make each a one-way
-    # switch a tenant could never turn back off. Only a field the caller actually named is
-    # reinstated, so an omitted one still means no change.
+    # whose null means "leave it alone". Four columns are the exceptions: null on the two
+    # retention windows means "keep forever" and null on the two usage caps means
+    # "unlimited", so dropping it would make each a one-way switch a tenant could never turn
+    # back off. Only a field the caller actually named is reinstated, so an omitted one still
+    # means no change.
     named = payload.model_dump(exclude_unset=True)
-    for field in ("retention_days", "nuvrag_mem_retention_days"):
+    for field in (
+        "retention_days",
+        "nuvrag_mem_retention_days",
+        "monthly_ingestion_unit_cap",
+        "monthly_retrieval_call_cap",
+    ):
         if field in named:
             updates[field] = named[field]
 

@@ -296,6 +296,7 @@ than internal service names.
 | `NUVRAG_MEM_PURGE_HOUR_UTC` / `_MINUTE_UTC` | `3` / `45` | its own slot, and its own Redis lock |
 | `NUVRAG_MEM_PURGE_BATCH_SIZE` | `500` | notes deleted per transaction |
 | `NUVRAG_MEM_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run |
+| `USAGE_CAP_FAIL_CLOSED` | `false` | what to do when the counters cannot be read — see [Usage caps](#usage-caps). *How much* a chatbot may spend is per chatbot, in the database |
 | `RATE_LIMIT_ENABLED` | `true` | |
 | `RATE_LIMIT_CHATBOT_CAPACITY` / `_REFILL_PER_SECOND` | `120` / `2.0` | per chatbot |
 | `RATE_LIMIT_SESSION_CAPACITY` / `_REFILL_PER_SECOND` | `20` / `0.25` | per widget session — the session id is browser-generated, so this shapes traffic rather than stopping abuse |
@@ -639,6 +640,83 @@ keeps their notes and simply stops being recognised until they escalate again.
 deployment. It runs at 03:45 UTC by default, fifteen minutes after the conversation sweep, and
 never shares its Redis lock — one key for two sweeps would let whichever ran first silently
 skip the other.
+
+## Usage caps
+
+Every ingestion and every answer spends money with whichever AI provider the tenant configured
+— and until this existed, nothing bounded that. The rate limiter shapes requests per second and
+forgets them a minute later; a chatbot can sit well inside its token bucket and still burn a
+month's budget. **Usage caps** are the other half: a ceiling on cumulative spend per chatbot per
+UTC calendar month.
+
+They are **off by default**. Both caps start null, which means unlimited, and a null cap never
+touches the counter at all.
+
+Two counters, set on the chatbot's settings page or over the API:
+
+| | What one unit is | What happens past the ceiling |
+|---|---|---|
+| `monthly_ingestion_unit_cap` | 4,000 bytes of uploaded document, rounded up — a 40 KB file costs 10 | the upload is refused with `429` |
+| `monthly_retrieval_call_cap` | one answered chat turn | the widget still replies, with your wording, and **no provider call is made** |
+
+```bash
+# 50,000 ingestion units and 10,000 answers a month
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"monthly_ingestion_unit_cap": 50000, "monthly_retrieval_call_cap": 10000}'
+
+# back to unlimited
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"monthly_ingestion_unit_cap": null, "monthly_retrieval_call_cap": null}'
+```
+
+`null` removes a cap rather than meaning "leave it alone" — the same exception the two retention
+fields get, and what stops a cap being a switch you can turn on and never off.
+
+**A capped chatbot still answers.** It returns `usage_cap_message` — yours to write, and worded
+by default to say nothing about limits or billing, because a visitor can only act on the part
+that concerns them. The turn is written to the transcript like any other, so the conversation
+does not have a hole in it, and the answer carries the same "talk to a human" offer a
+grounding miss does. What it does **not** do is fall back to an ungrounded answer: that would
+still spend the money the cap exists to save.
+
+**Refused uploads** answer `429` with the current total and the ceiling in `details`:
+
+```json
+{"error": {"code": "usage_cap_exceeded",
+           "message": "This chatbot has reached its monthly ingestion limit...",
+           "details": {"kind": "ingestion", "used": 50000, "cap": 50000}}}
+```
+
+There is no `Retry-After`: the wait is until the calendar turns over, not a number of seconds.
+
+**When the counters cannot be reached** — Postgres down, or unreachable — the cap status is
+unknown, and the default is to **let the request through**. A transient blip silencing every
+widget on the platform is worse than a bounded amount of uncounted spend during it, and the
+outage hiding the counters is generally also stopping the work being counted. This is the one
+judgement here an operator can flip:
+
+```bash
+USAGE_CAP_FAIL_CLOSED=true   # refuse instead, when the counters cannot be read
+```
+
+Both enforcement points read that one setting, so uploads and answers can never disagree about
+it.
+
+**A note on precision.** An upload's true cost is not known until it has been streamed, because
+the unit is derived from the file's size. So a chatbot already at its ceiling is refused before
+a byte moves, and the exact charge is settled after — which means one upload that *started*
+under the cap can carry it past, by at most one document's worth (25 MB, or 6,554 units). Every
+subsequent upload is refused. Answers have no such gap: a turn costs exactly one.
+
+**Nothing is backfilled.** Counters start at zero for every chatbot when this ships, whatever
+volume is already ingested — a cap is a ceiling on what happens next.
+
+Current usage is on the settings page and in `GET /api/v1/chatbots/{id}` as `usage`. The list
+endpoint leaves it null rather than doing a lookup per row. A cap being hit is counted as
+`rag_usage_cap_blocks_total` and logged as `usage_cap.blocked`; nobody is emailed, because
+there is no mail transport in this deployment.
 
 ## Keeping spam out of the ticket queue
 

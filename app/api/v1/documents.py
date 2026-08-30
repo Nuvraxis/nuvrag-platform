@@ -22,12 +22,17 @@ async def upload_document(
     principal: CurrentPrincipal,
     file: UploadFile = File(..., description="PDF, DOCX, Markdown or plain text"),
 ) -> DocumentUploadResponse:
-    """Accepted immediately; parsing and embedding happen on the ingestion worker."""
+    """Accepted immediately; parsing and embedding happen on the ingestion worker.
+
+    Answers 429 when the chatbot has spent its monthly ingestion allowance, with the current
+    total and the ceiling in `details` so the dashboard can say which it is.
+    """
     outcome = await document_service.upload_document(
         org_id=principal.org_id,
         chatbot_id=chatbot.id,
         uploaded_by=principal.user.id,
         upload=file,
+        cap_units=chatbot.monthly_ingestion_unit_cap,
     )
     return DocumentUploadResponse(
         document=DocumentRead.model_validate(outcome.document), task_id=outcome.task_id

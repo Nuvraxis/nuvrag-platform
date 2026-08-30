@@ -111,4 +111,7 @@ TENANT_SCOPED_TABLES = (
     # partition, because a partition is a table a role could reach directly. Migration 0012
     # does both.
     "memory_entry",
+    # Carries org_id of its own rather than reaching through chatbot_id, so the policy
+    # here reads exactly like every other one. Migration 0014.
+    "chatbot_usage_period",
 )

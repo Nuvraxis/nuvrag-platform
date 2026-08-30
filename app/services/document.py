@@ -10,6 +10,7 @@ from app.core.exceptions import (
     NotFoundError,
     PayloadTooLargeError,
     UnsupportedMediaTypeError,
+    UsageCapExceededError,
 )
 from app.core.logging import get_logger
 from app.db.session import tenant_session
@@ -17,6 +18,7 @@ from app.models import Document, DocumentStatus, FileType
 from app.repositories import DocumentRepository
 from app.services.ai import factory
 from app.services.storage import build_storage_key, get_object_storage
+from app.services.usage import UsageKind, consume, headroom, ingestion_units
 
 logger = get_logger(__name__)
 
@@ -119,7 +121,12 @@ class _MeteredStream:
 
 
 async def upload_document(
-    *, org_id: UUID, chatbot_id: UUID, uploaded_by: UUID, upload: UploadFile
+    *,
+    org_id: UUID,
+    chatbot_id: UUID,
+    uploaded_by: UUID,
+    upload: UploadFile,
+    cap_units: int | None = None,
 ) -> UploadOutcome:
     """Validate, stream to object storage, record the document, then hand off to the worker.
 
@@ -133,6 +140,20 @@ async def upload_document(
     # embed costs the tenant the transfer and hands them a `failed` document minutes later.
     await factory.require_embedding_ready(org_id, chatbot_id)
 
+    # First of two cap checks, and the cheap one. What an upload actually costs is not known
+    # until it has been streamed — the unit is derived from `size_bytes`, which `_MeteredStream`
+    # only knows once it has read the file — so a chatbot that is *already* at its ceiling is
+    # turned away here, before a byte moves. The exact charge is settled below.
+    allowance = await headroom(org_id, chatbot_id, kind=UsageKind.INGESTION, cap=cap_units)
+    if not allowance.allowed:
+        raise UsageCapExceededError(
+            "This chatbot has reached its monthly ingestion limit. It resets at the start of "
+            "next month, or an administrator can raise the limit.",
+            kind=str(UsageKind.INGESTION),
+            used=allowance.used,
+            cap=allowance.cap,
+        )
+
     document_id = uuid4()
     storage_key = build_storage_key(org_id, chatbot_id, document_id, filename)
     stream = _MeteredStream(upload, file_type, settings.ingestion.max_upload_bytes)
@@ -145,6 +166,23 @@ async def upload_document(
     except PayloadTooLargeError, UnsupportedMediaTypeError:
         await storage.delete(storage_key)
         raise
+
+    units = ingestion_units(stream.size)
+
+    # Second check, with the real cost. An upload that started under the cap can carry it past
+    # by at most one document — bounded by `INGESTION_MAX_UPLOAD_BYTES` — because its size was
+    # unknowable beforehand. Charged before the row is written, so a refusal leaves nothing
+    # behind but the object this deletes.
+    spend = await consume(org_id, chatbot_id, kind=UsageKind.INGESTION, amount=units, cap=cap_units)
+    if not spend.allowed:
+        await storage.delete(storage_key)
+        raise UsageCapExceededError(
+            "This document would take the chatbot past its monthly ingestion limit. It resets "
+            "at the start of next month, or an administrator can raise the limit.",
+            kind=str(UsageKind.INGESTION),
+            used=spend.used,
+            cap=spend.cap,
+        )
 
     async with tenant_session(org_id) as session:
         document = await DocumentRepository(session).add(
@@ -169,6 +207,7 @@ async def upload_document(
         document_id=str(document_id),
         chatbot_id=str(chatbot_id),
         size_bytes=stream.size,
+        ingestion_units=units,
         task_id=task_id,
     )
     return UploadOutcome(document=document, task_id=task_id)

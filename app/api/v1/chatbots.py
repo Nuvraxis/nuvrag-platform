@@ -12,6 +12,7 @@ from app.schemas.chatbot import (
     ChatbotSecret,
     ChatbotUpdate,
     EmbedSnippet,
+    UsagePeriodRead,
 )
 from app.schemas.common import Page
 from app.services import analytics as analytics_service
@@ -47,8 +48,13 @@ async def list_chatbots(
 
 
 @router.get("/{chatbot_id}", response_model=ChatbotRead)
-async def get_chatbot(chatbot: OwnedChatbot) -> ChatbotRead:
-    return ChatbotRead.model_validate(chatbot)
+async def get_chatbot(chatbot: OwnedChatbot, principal: CurrentPrincipal) -> ChatbotRead:
+    """The detail view, which is the only place `usage` is populated — the list endpoint
+    would need one lookup per row to do the same."""
+    usage = await chatbot_service.current_usage(principal.org_id, chatbot.id)
+    return ChatbotRead.model_validate(chatbot).model_copy(
+        update={"usage": UsagePeriodRead.model_validate(usage) if usage else None}
+    )
 
 
 @router.patch("/{chatbot_id}", response_model=ChatbotRead)

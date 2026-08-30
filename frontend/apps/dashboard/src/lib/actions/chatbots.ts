@@ -15,6 +15,7 @@ import {
   originList,
   retentionDays,
   text,
+  usageCap,
 } from '@/lib/form'
 
 /** The plaintext secret exists only in this response, so the form renders it once. */
@@ -50,6 +51,9 @@ export async function createChatbotAction(
       model_config_json: generationConfig(formData),
       retention_days: retentionDays(formData),
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
+      monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),
+      monthly_retrieval_call_cap: usageCap(formData, 'monthly_retrieval_call_cap'),
+      usage_cap_message: text(formData, 'usage_cap_message'),
       // Empty on purpose. The footer links are edited on the design tab beside the widget
       // preview that shows them, so the create form does not ask for them — a chatbot starts
       // with none, exactly as it starts with no theme.
@@ -96,6 +100,11 @@ export async function updateChatbotAction(
       // treats that way, and what makes either retention something a tenant can switch off.
       retention_days: retentionDays(formData),
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
+      // Null removes a cap rather than leaving it alone, the same exception the two
+      // retention fields get.
+      monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),
+      monthly_retrieval_call_cap: usageCap(formData, 'monthly_retrieval_call_cap'),
+      usage_cap_message: text(formData, 'usage_cap_message'),
       status: chatbotStatus(formData, 'status'),
     })
   } catch (error) {

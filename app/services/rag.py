@@ -10,6 +10,7 @@ from app.core.logging import get_logger
 from app.core.security import session_log_id
 from app.db.session import tenant_session
 from app.models import Conversation, Message, MessageRole
+from app.models.chatbot import DEFAULT_USAGE_CAP_MESSAGE
 from app.repositories import (
     ConversationRepository,
     DocumentChunkRepository,
@@ -22,6 +23,7 @@ from app.repositories import (
 from app.services.ai import factory
 from app.services.ai.prompts import Citation, build_chat_messages, build_citations
 from app.services.nuvrag_mem.retrieval import recall
+from app.services.usage import UsageKind, consume
 
 logger = get_logger(__name__)
 
@@ -32,6 +34,9 @@ class ChatContext:
     chatbot_id: UUID
     system_prompt: str
     generation_config: dict[str, Any]
+    # None means unlimited, which is what every chatbot starts at.
+    retrieval_call_cap: int | None = None
+    usage_cap_message: str = DEFAULT_USAGE_CAP_MESSAGE
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +228,51 @@ def _enqueue_memory_extraction(org_id: UUID, conversation_id: UUID) -> None:
         )
 
 
+async def _capped_turn(
+    context: ChatContext,
+    *,
+    question: str,
+    external_session_id: str,
+    started: float,
+) -> AsyncIterator[dict[str, Any]]:
+    """The turn a chatbot that has spent its month serves instead.
+
+    No embedding call, no generation call, and no memory extraction queued afterwards — that
+    last one runs a chat completion on the worker, so enqueuing it here would spend exactly
+    the money the cap exists to stop.
+
+    The visitor still gets a real turn rather than an error: the same event shape, the
+    operator's own wording streamed as one token, and both messages written to the transcript.
+    A conversation missing the turn it refused would be worse to read back than one that says
+    plainly it could not answer.
+    """
+    yield {"event": "sources", "data": {"sources": []}}
+    yield {"event": "token", "data": {"content": context.usage_cap_message}}
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    turn = await _persist_turn(
+        context,
+        external_session_id=external_session_id,
+        question=question,
+        answer=context.usage_cap_message,
+        citations=[],
+        memories=[],
+        latency_ms=latency_ms,
+    )
+
+    yield {
+        "event": "done",
+        "data": {
+            "conversation_id": str(turn.conversation_id),
+            "message_id": str(turn.message_id),
+            "latency_ms": latency_ms,
+            # Nothing was retrieved, so this is true for the same reason a grounding miss
+            # makes it true — the assistant cannot help and a human might.
+            "can_escalate": True,
+        },
+    }
+
+
 async def stream_answer(
     context: ChatContext, *, question: str, external_session_id: str
 ) -> AsyncIterator[dict[str, Any]]:
@@ -236,8 +286,28 @@ async def stream_answer(
         chatbot_id=str(context.chatbot_id), session=session_log_id(external_session_id)
     )
 
+    # Charged before the embedding call and before generation, because both spend money and
+    # a cap that let one of them through would not be a cap. Reserving first also means a
+    # provider failure after this point costs the tenant a call, which is the same trade the
+    # token bucket makes and the honest one: the spend was authorised, not the outcome.
+    spend = await consume(
+        context.org_id,
+        context.chatbot_id,
+        kind=UsageKind.RETRIEVAL,
+        amount=1,
+        cap=context.retrieval_call_cap,
+    )
+    if not spend.allowed:
+        async for event in _capped_turn(
+            context, question=question, external_session_id=external_session_id, started=started
+        ):
+            yield event
+        return
+
     # Built before the first token is retrieved so a missing provider surfaces as a clean
-    # error rather than after the visitor has already seen a `sources` event.
+    # error rather than after the visitor has already seen a `sources` event. After the cap
+    # check, so a chatbot that has spent its month does not read its AI configuration or
+    # decrypt a credential to say so.
     chat = await factory.get_chat_provider(
         context.org_id, context.chatbot_id, context.generation_config
     )

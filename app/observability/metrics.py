@@ -37,6 +37,14 @@ retrieval_chunks = Histogram(
     buckets=(0, 1, 2, 3, 5, 8, 13, 20),
 )
 
+# A cap being hit is the one event in this feature nobody is notified about — there is no
+# mail transport — so it has to be visible on the metrics pipeline instead.
+usage_cap_blocks_total = Counter(
+    "rag_usage_cap_blocks_total",
+    "Requests refused because a chatbot reached its monthly usage cap",
+    labelnames=("chatbot_id", "kind"),
+)
+
 widget_requests_total = Counter(
     "rag_widget_requests_total",
     "Widget chat requests by outcome",
