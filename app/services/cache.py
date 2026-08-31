@@ -29,6 +29,8 @@ def _serialise(chatbot: Chatbot) -> str:
             "status": str(chatbot.status),
             "monthly_retrieval_call_cap": chatbot.monthly_retrieval_call_cap,
             "usage_cap_message": chatbot.usage_cap_message,
+            "nuvrag_mem_similarity_override": chatbot.nuvrag_mem_similarity_override,
+            "nuvrag_mem_similarity_calibrated": chatbot.nuvrag_mem_similarity_calibrated,
         }
     )
 

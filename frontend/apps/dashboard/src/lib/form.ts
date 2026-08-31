@@ -64,6 +64,19 @@ export function nuvragMemRetentionDays(formData: FormData): number | null {
   return Number.isFinite(parsed) ? Math.round(parsed) : null
 }
 
+/**
+ * Blank means "go by whatever was calibrated for this chatbot's embedding model", which is a
+ * value rather than a missing one — the same spelling as `retentionDays`, and the API
+ * reinstates a null override for the same reason. Not rounded, unlike every other blankable
+ * field here: this one is a cosine similarity, not a count of anything.
+ */
+export function similarityOverride(formData: FormData): number | null {
+  const raw = text(formData, 'nuvrag_mem_similarity_override')
+  if (!raw) return null
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
 export function generationConfig(formData: FormData): GenerationConfig {
   return {
     temperature: number(formData, 'temperature', 0.2),

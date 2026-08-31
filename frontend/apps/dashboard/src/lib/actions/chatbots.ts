@@ -14,6 +14,7 @@ import {
   optionalText,
   originList,
   retentionDays,
+  similarityOverride,
   text,
   usageCap,
 } from '@/lib/form'
@@ -51,6 +52,7 @@ export async function createChatbotAction(
       model_config_json: generationConfig(formData),
       retention_days: retentionDays(formData),
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
+      nuvrag_mem_similarity_override: similarityOverride(formData),
       monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),
       monthly_retrieval_call_cap: usageCap(formData, 'monthly_retrieval_call_cap'),
       usage_cap_message: text(formData, 'usage_cap_message'),
@@ -100,6 +102,8 @@ export async function updateChatbotAction(
       // treats that way, and what makes either retention something a tenant can switch off.
       retention_days: retentionDays(formData),
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
+      // And null here drops an override, putting the chatbot back on its measured floor.
+      nuvrag_mem_similarity_override: similarityOverride(formData),
       // Null removes a cap rather than leaving it alone, the same exception the two
       // retention fields get.
       monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),
@@ -184,6 +188,29 @@ function themeFromForm(formData: FormData): WidgetTheme {
 function themeScheme(formData: FormData): WidgetTheme['scheme'] {
   const value = text(formData, 'scheme')
   return value === 'light' || value === 'dark' ? value : 'system'
+}
+
+export async function recalibrateMemoryAction(
+  _previous: ActionState,
+  formData: FormData,
+): Promise<ActionState> {
+  const chatbotId = text(formData, 'chatbot_id')
+  if (!chatbotId) {
+    return failed('Missing chatbot reference.')
+  }
+
+  const api = await authenticatedApi()
+  let measured
+  try {
+    measured = await api.recalibrateMemory(chatbotId)
+  } catch (error) {
+    return fromError(error)
+  }
+
+  revalidatePath(`/chatbots/${chatbotId}`, 'layout')
+  return succeeded(
+    `Measured against this chatbot's embedding model: ${measured.calibrated?.toFixed(3)}.`,
+  )
 }
 
 export async function rotateSecretAction(

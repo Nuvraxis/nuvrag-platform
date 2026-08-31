@@ -22,6 +22,7 @@ from app.repositories import (
 )
 from app.services.ai import factory
 from app.services.ai.prompts import Citation, build_chat_messages, build_citations
+from app.services.nuvrag_mem.calibration import CalibrationState
 from app.services.nuvrag_mem.retrieval import recall
 from app.services.usage import UsageKind, consume
 
@@ -37,6 +38,11 @@ class ChatContext:
     # None means unlimited, which is what every chatbot starts at.
     retrieval_call_cap: int | None = None
     usage_cap_message: str = DEFAULT_USAGE_CAP_MESSAGE
+    # The two nuvrag_mem similarity columns, carried rather than looked up so the chat path
+    # pays no query for a value that changes about once in a chatbot's life. Both None means
+    # nothing has been measured yet, which is what makes the next recall calibrate.
+    nuvrag_mem_similarity_override: float | None = None
+    nuvrag_mem_similarity_calibrated: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,10 +141,17 @@ async def retrieve(
         )
         memories = await recall(
             session,
+            org_id=context.org_id,
             chatbot_id=context.chatbot_id,
             subject_id=external_session_id,
             embedding=query_vector,
             dimension=embedder.dimension,
+            state=CalibrationState(
+                override=context.nuvrag_mem_similarity_override,
+                calibrated=context.nuvrag_mem_similarity_calibrated,
+                calibrated_at=None,
+            ),
+            embedder=embedder,
         )
 
     return Recollection(matches=matches, memories=memories)

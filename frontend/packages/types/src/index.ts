@@ -42,6 +42,8 @@ export type ChatbotStatus = Schemas['ChatbotStatus']
 export type GenerationConfig = Schemas['GenerationConfig']
 export type WidgetTheme = Schemas['WidgetTheme']
 export type EmbedSnippet = Schemas['EmbedSnippet']
+export type MemoryCalibration = Schemas['MemoryCalibrationRead']
+export type UsagePeriod = Schemas['UsagePeriodRead']
 
 /* AI providers */
 export type AIConfig = Schemas['AIConfigRead']

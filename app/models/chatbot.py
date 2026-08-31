@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import ConfigDict
@@ -6,6 +7,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 from app.models.base import (
+    UTC_TIMESTAMP,
     OrgScopedMixin,
     TimestampMixin,
     UUIDPrimaryKeyMixin,
@@ -77,6 +79,24 @@ USAGE_CAP_CHECKS = {
     ),
 }
 
+# Bounds for both nuvrag_mem similarity columns. A cosine similarity between two embeddings
+# of the same model is in [-1, 1] in general, but every provider here returns normalised
+# vectors and the recall comparison only ever runs on non-negative territory — a floor at or
+# below zero would admit everything, which is what "no gate at all" already means.
+SIMILARITY_MIN = 0.0
+SIMILARITY_MAX = 1.0
+
+NUVRAG_MEM_SIMILARITY_CHECKS = {
+    "nuvrag_mem_similarity_override": (
+        f"nuvrag_mem_similarity_override IS NULL OR "
+        f"nuvrag_mem_similarity_override BETWEEN {SIMILARITY_MIN} AND {SIMILARITY_MAX}"
+    ),
+    "nuvrag_mem_similarity_calibrated": (
+        f"nuvrag_mem_similarity_calibrated IS NULL OR "
+        f"nuvrag_mem_similarity_calibrated BETWEEN {SIMILARITY_MIN} AND {SIMILARITY_MAX}"
+    ),
+}
+
 # What a visitor is told when the chatbot has spent its month. Deliberately says nothing about
 # quotas or billing: that is the operator's business, and a visitor can only act on the part
 # that concerns them.
@@ -109,6 +129,10 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
         CheckConstraint(RETENTION_CHECK, name="retention_days"),
         CheckConstraint(NUVRAG_MEM_RETENTION_CHECK, name="nuvrag_mem_retention_days"),
         *(CheckConstraint(sql, name=column) for column, sql in USAGE_CAP_CHECKS.items()),
+        *(
+            CheckConstraint(sql, name=column)
+            for column, sql in NUVRAG_MEM_SIMILARITY_CHECKS.items()
+        ),
     )
 
     # `model_config_json` collides with Pydantic's reserved `model_` namespace.
@@ -154,6 +178,25 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
     # The 30 a new chatbot starts at lives in `ChatbotCreate` instead, which sends it as a
     # value like any other. See `NUVRAG_MEM_RETENTION_DEFAULT_DAYS`.
     nuvrag_mem_retention_days: int | None = Field(default=None, nullable=True)
+
+    # The cosine floor a recalled note has to clear, in two columns because they answer two
+    # different questions. `override` is what an operator decided and is never recalculated;
+    # `calibrated` is what this chatbot's own embedding model measured, and NULL means "not
+    # measured for the configuration currently saved". There is deliberately no third column
+    # holding an effective value: it is `override ?? calibrated`, and storing a derived thing
+    # is how the two get to disagree.
+    #
+    # NULL on `calibrated` is meaningful in the same way the columns above it are — it is the
+    # signal that makes the next recall attempt calibrate — so, as ever since 0013, neither
+    # column carries a default of any kind.
+    nuvrag_mem_similarity_override: float | None = Field(default=None, nullable=True)
+    nuvrag_mem_similarity_calibrated: float | None = Field(default=None, nullable=True)
+    # Display only. What an operator needs in order to read a threshold is when it was
+    # measured, because a calibration made before an embedding model changed describes a
+    # model this chatbot no longer uses.
+    nuvrag_mem_similarity_calibrated_at: datetime | None = Field(
+        default=None, sa_type=UTC_TIMESTAMP, nullable=True
+    )
 
     # No default of any kind on either cap, for the reason migration 0013 spells out: NULL is
     # meaningful here — it means unlimited — and SQLAlchemy treats a None at insert time as

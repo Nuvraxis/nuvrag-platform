@@ -122,31 +122,49 @@ export const USAGE_CAP_MAX = 1_000_000_000
 
 const DAYS = { min: RETENTION_MIN_DAYS, max: RETENTION_MAX_DAYS, unit: 'days' }
 const CAP_UNITS = { min: USAGE_CAP_MIN, max: USAGE_CAP_MAX, unit: 'units' }
+/** A cosine similarity, so a fraction rather than a count — the one blankable field that is
+    not a whole number of anything. Mirrors `SIMILARITY_MIN` / `SIMILARITY_MAX`. */
+const SIMILARITY = { min: 0, max: 1, unit: '', whole: false }
 
 /**
  * The fields whose *empty* value means something. Blank is "no limit" — "keep this forever"
- * for the two retention windows, "spend without a ceiling" for the two usage caps — and none
- * of them is the same as zero, which the API and the database both refuse precisely because
- * it would read as "allow nothing". `numeric` reports blank as missing, which is right for
- * every other field on this form and wrong for these four.
+ * for the two retention windows, "spend without a ceiling" for the two usage caps, "use the
+ * calibrated floor" for the memory threshold — and none of them is the same as zero, which
+ * the API and the database refuse for the first four precisely because it would read as
+ * "allow nothing". `numeric` reports blank as missing, which is right for every other field
+ * on this form and wrong for these five.
  *
- * One builder rather than four hand-written schemas, so they cannot drift into validating
- * differently. What they legitimately differ on is their bounds, their wording, and — for
- * memory retention alone — a non-blank starting value, which lives in `chatbotDefaults`.
+ * One builder rather than five hand-written schemas, so they cannot drift into validating
+ * differently. What they legitimately differ on is their bounds, their wording, whether they
+ * are whole numbers, and — for memory retention alone — a non-blank starting value, which
+ * lives in `chatbotDefaults`.
  */
 function blankableNumber(
   label: string,
   blankMeans: string,
-  { min, max, unit }: { min: number; max: number; unit: string },
+  {
+    min,
+    max,
+    unit,
+    whole = true,
+  }: { min: number; max: number; unit: string; whole?: boolean },
 ) {
+  const range = unit ? `${min} and ${max} ${unit}` : `${min} and ${max}`
+
   return z
     .union([z.number(), z.string()])
     .transform((value) => (typeof value === 'string' ? value.trim() : value))
-    .refine((value) => value === '' || Number.isInteger(Number(value)), {
-      message: `Enter a whole number of ${unit}, or leave it blank to ${blankMeans}.`,
-    })
+    .refine(
+      (value) =>
+        value === '' || (whole ? Number.isInteger(Number(value)) : Number.isFinite(Number(value))),
+      {
+        message: whole
+          ? `Enter a whole number of ${unit}, or leave it blank to ${blankMeans}.`
+          : `Enter a number, or leave it blank to ${blankMeans}.`,
+      },
+    )
     .refine((value) => value === '' || (Number(value) >= min && Number(value) <= max), {
-      message: `${label} must be between ${min} and ${max} ${unit}.`,
+      message: `${label} must be between ${range}.`,
     })
 }
 
@@ -154,6 +172,12 @@ const retentionDays = blankableNumber('Retention', 'keep conversations forever',
 
 /** Mirrors `NUVRAG_MEM_RETENTION_MIN_DAYS` / `_MAX_DAYS`, which are the same bounds. */
 const memoryRetentionDays = blankableNumber('Memory retention', 'keep visitor memory forever', DAYS)
+
+const memorySimilarityOverride = blankableNumber(
+  'The memory threshold',
+  'use the calibrated value',
+  SIMILARITY,
+)
 
 const ingestionCap = blankableNumber('The ingestion limit', 'allow unlimited uploads', CAP_UNITS)
 const retrievalCap = blankableNumber('The answer limit', 'allow unlimited answers', CAP_UNITS)
@@ -180,6 +204,7 @@ export const chatbotSchema = z.object({
   min_similarity: numeric('Minimum similarity', 0, 1),
   retention_days: retentionDays,
   nuvrag_mem_retention_days: memoryRetentionDays,
+  nuvrag_mem_similarity_override: memorySimilarityOverride,
   monthly_ingestion_unit_cap: ingestionCap,
   monthly_retrieval_call_cap: retrievalCap,
   usage_cap_message: z.string().max(1000, 'Keep the message to 1000 characters or fewer.'),

@@ -4,6 +4,7 @@ import type { Metadata } from 'next'
 import { ActionForm } from '@/components/action-form'
 import { ChatbotSettingsForm } from '@/components/chatbot-settings-form'
 import { ConfirmSubmit } from '@/components/confirm-submit'
+import { RecalibrateMemoryPanel } from '@/components/recalibrate-memory-panel'
 import { deleteChatbotAction } from '@/lib/actions/chatbots'
 import { fetchApi } from '@/lib/api'
 import { Suspense } from 'react'
@@ -13,11 +14,16 @@ export const metadata: Metadata = { title: 'Settings' }
 
 async function Settings({ params }: { params: Promise<{ chatbotId: string }> }) {
   const { chatbotId } = await params
-  const chatbot = await fetchApi((api) => api.getChatbot(chatbotId))
+  const [chatbot, calibration] = await Promise.all([
+    fetchApi((api) => api.getChatbot(chatbotId)),
+    fetchApi((api) => api.memoryCalibration(chatbotId)),
+  ])
 
   return (
     <div className="space-y-6">
-      <ChatbotSettingsForm chatbot={chatbot} />
+      <ChatbotSettingsForm chatbot={chatbot} calibration={calibration} />
+
+      <RecalibrateMemoryPanel chatbotId={chatbot.id} calibration={calibration} />
 
       <Card className="border-destructive/40">
         <CardHeader>

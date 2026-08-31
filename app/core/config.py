@@ -237,10 +237,11 @@ class NuvragMemSettings(BaseSettings):
     # person, not a corpus, and a large k here mostly buys weakly-related facts crowding the
     # prompt next to the documents that actually answer the question.
     retrieval_top_k: int = Field(default=5, ge=1, le=50)
-    # Higher than document retrieval's 0.25 floor, because the cost of a wrong hit is worse:
-    # an irrelevant passage is ignorable, whereas an irrelevant "fact about you" is the model
-    # confidently telling a visitor something untrue about themselves.
-    retrieval_min_similarity: float = Field(default=0.45, ge=0.0, le=1.0)
+    # There is deliberately no `retrieval_min_similarity` here any more. It was one number for
+    # a whole deployment, and a cosine floor is a property of an embedding model rather than
+    # of the task — while every chatbot on the platform picks its own embedding provider and
+    # model. See `app/services/nuvrag_mem/calibration.py`: the floor is measured per chatbot,
+    # against the model it actually uses, and lives in two columns on `chatbot`.
 
     # --- write path ---
     # How many recent turns the extractor is shown. Enough for a preference stated across two

@@ -1,6 +1,6 @@
 'use client'
 
-import type { Chatbot, GenerationConfig } from '@rag/api-client'
+import type { Chatbot, GenerationConfig, MemoryCalibration } from '@rag/api-client'
 import { FieldGroup, FieldLegend, FieldSet, Input, Textarea } from '@rag/ui'
 import { useWatch, type Control } from 'react-hook-form'
 
@@ -53,6 +53,12 @@ export function chatbotDefaults(chatbot?: Chatbot): ChatbotValues {
         ? ''
         : String(chatbot.nuvrag_mem_retention_days)
       : String(NUVRAG_MEM_RETENTION_DEFAULT_DAYS),
+    // Blank is "go by the calibrated value", which is what almost every chatbot should be on
+    // — so unlike memory retention there is no non-blank starting value here.
+    nuvrag_mem_similarity_override:
+      chatbot?.nuvrag_mem_similarity_override == null
+        ? ''
+        : String(chatbot.nuvrag_mem_similarity_override),
     // Both caps start blank, which is unlimited. Unlike memory retention there is no
     // non-blank starting value to distinguish an absent field from a cleared one.
     monthly_ingestion_unit_cap:
@@ -92,6 +98,40 @@ function UsageLine({
   )
 }
 
+const SOURCE_LABEL: Record<MemoryCalibration['source'], string> = {
+  override: 'Set by you',
+  calibrated: "Measured against this chatbot's embedding model",
+  uncalibrated: 'Not measured yet — nothing is recalled until it is',
+}
+
+/**
+ * What the recall gate is currently doing, and how old that answer is. The timestamp is the
+ * point of it: a threshold measured before an embedding model changed describes a model this
+ * chatbot no longer uses.
+ */
+function CalibrationReadout({ calibration }: { calibration: MemoryCalibration }) {
+  const measured = calibration.calibrated_at
+    ? new Date(calibration.calibrated_at).toLocaleString()
+    : null
+
+  return (
+    <div className="border-border bg-muted space-y-1 rounded-md border px-3 py-2">
+      <div className="flex items-baseline justify-between gap-4 text-sm">
+        <span className="text-muted-foreground">Threshold in use</span>
+        <span className="text-foreground tabular-nums">
+          {calibration.effective_threshold == null
+            ? 'none'
+            : calibration.effective_threshold.toFixed(3)}
+        </span>
+      </div>
+      <p className="text-muted-foreground text-xs">
+        {SOURCE_LABEL[calibration.source]}
+        {measured ? ` · measured ${measured}` : ''}
+      </p>
+    </div>
+  )
+}
+
 /**
  * The editable surface of a chatbot, shared by the create and settings forms so the two can
  * never drift apart.
@@ -99,11 +139,15 @@ function UsageLine({
 export function ChatbotFields({
   control,
   usage,
+  calibration,
 }: {
   control: Control<ChatbotValues>
   /** This month's totals, which only the settings form has — the create form has no chatbot
       to have spent anything yet. */
   usage?: Chatbot['usage']
+  /** Likewise: a chatbot that does not exist has no embedding model to have been measured
+      against, so the create form shows the override field with nothing above it. */
+  calibration?: MemoryCalibration
 }) {
   return (
     <>
@@ -182,26 +226,60 @@ export function ChatbotFields({
         )}
       </FormField>
 
-      <FormField
-        control={control}
-        name="nuvrag_mem_retention_days"
-        label="Delete visitor memory after"
-        description="Days, counted from the last time a note was used. Unlike conversations, this starts at 30 days rather than at forever — a note is a standing summary of a person across visits, not a record of one exchange. Leave blank to keep memory indefinitely."
-      >
-        {({ field, invalid }) => (
-          <Input
-            {...field}
-            id={field.name}
-            type="number"
-            inputMode="numeric"
-            min={RETENTION_MIN_DAYS}
-            max={RETENTION_MAX_DAYS}
-            step={1}
-            placeholder="Keep forever"
-            aria-invalid={invalid}
-          />
-        )}
-      </FormField>
+      <FieldSet className="border-border rounded-xl border p-4">
+        <FieldLegend variant="label" className="px-1">
+          Visitor memory
+        </FieldLegend>
+        <FieldGroup>
+          <FormField
+            control={control}
+            name="nuvrag_mem_retention_days"
+            label="Delete visitor memory after"
+            description="Days, counted from the last time a note was used. Unlike conversations, this starts at 30 days rather than at forever — a note is a standing summary of a person across visits, not a record of one exchange. Leave blank to keep memory indefinitely."
+          >
+            {({ field, invalid }) => (
+              <Input
+                {...field}
+                id={field.name}
+                type="number"
+                inputMode="numeric"
+                min={RETENTION_MIN_DAYS}
+                max={RETENTION_MAX_DAYS}
+                step={1}
+                placeholder="Keep forever"
+                aria-invalid={invalid}
+              />
+            )}
+          </FormField>
+
+          {calibration ? <CalibrationReadout calibration={calibration} /> : null}
+
+          <FormField
+            control={control}
+            name="nuvrag_mem_similarity_override"
+            label="Recall threshold"
+            description="How closely a remembered note must match the visitor's question before it is used, from 0 to 1. Leave blank to use the value measured against this chatbot's own embedding model, which is what almost every chatbot should be on — a threshold that suits one model is generally wrong for another. Raise it to remember less and more surely."
+          >
+            {({ field, invalid }) => (
+              <Input
+                {...field}
+                id={field.name}
+                type="number"
+                inputMode="decimal"
+                min={0}
+                max={1}
+                step="any"
+                placeholder={
+                  calibration?.calibrated == null
+                    ? 'Not yet measured'
+                    : `Calibrated: ${calibration.calibrated.toFixed(3)}`
+                }
+                aria-invalid={invalid}
+              />
+            )}
+          </FormField>
+        </FieldGroup>
+      </FieldSet>
 
       <FieldSet className="border-border rounded-xl border p-4">
         <FieldLegend variant="label" className="px-1">

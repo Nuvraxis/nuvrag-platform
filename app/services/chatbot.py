@@ -3,15 +3,21 @@ from uuid import UUID
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, UpstreamServiceError
 from app.core.security import generate_public_key, generate_secret_key, hash_api_key
 from app.core.slug import randomised_slug, slugify, unique_slug
 from app.db.session import tenant_session
 from app.models import Chatbot, ChatbotStatus, ChatbotUsagePeriod
 from app.repositories import ChatbotRepository
-from app.schemas.chatbot import ChatbotCreate, ChatbotUpdate, EmbedSnippet
+from app.schemas.chatbot import (
+    ChatbotCreate,
+    ChatbotUpdate,
+    EmbedSnippet,
+    MemoryCalibrationRead,
+)
 from app.services import usage
 from app.services.cache import ChatbotConfigCache
+from app.services.nuvrag_mem.calibration import MANUAL_ATTEMPTS, CalibrationState, calibrate
 from app.services.redis_client import get_redis
 
 SLUG_MAX_LENGTH = 100
@@ -35,6 +41,7 @@ def _build(org_id: UUID, payload: ChatbotCreate, slug: str, secret_key: str) -> 
         theme_json=payload.theme_json.model_dump(exclude_none=True),
         retention_days=payload.retention_days,
         nuvrag_mem_retention_days=payload.nuvrag_mem_retention_days,
+        nuvrag_mem_similarity_override=payload.nuvrag_mem_similarity_override,
         monthly_ingestion_unit_cap=payload.monthly_ingestion_unit_cap,
         monthly_retrieval_call_cap=payload.monthly_retrieval_call_cap,
         usage_cap_message=payload.usage_cap_message,
@@ -101,19 +108,52 @@ async def current_usage(org_id: UUID, chatbot_id: UUID) -> ChatbotUsagePeriod | 
         return await usage.current_period(session, chatbot_id)
 
 
+def memory_calibration(chatbot: Chatbot) -> MemoryCalibrationRead:
+    """What the similarity gate is currently doing, read straight off the row."""
+    state = CalibrationState(
+        override=chatbot.nuvrag_mem_similarity_override,
+        calibrated=chatbot.nuvrag_mem_similarity_calibrated,
+        calibrated_at=chatbot.nuvrag_mem_similarity_calibrated_at,
+    )
+    return MemoryCalibrationRead(
+        effective_threshold=state.effective,
+        source=state.source,
+        override=state.override,
+        calibrated=state.calibrated,
+        calibrated_at=state.calibrated_at,
+    )
+
+
+async def recalibrate_memory(org_id: UUID, chatbot_id: UUID) -> MemoryCalibrationRead:
+    """Measure the similarity floor now, rather than waiting for the next returning visitor.
+
+    Unlike the inline path this retries: an operator has asked explicitly and is watching the
+    button, so a single flaky response is worth a second attempt rather than a failure they
+    have to trigger again themselves.
+    """
+    threshold = await calibrate(org_id, chatbot_id, attempts=MANUAL_ATTEMPTS)
+    if threshold is None:
+        raise UpstreamServiceError(
+            "The embedding provider could not be reached, so no similarity floor was "
+            "measured. The chatbot's AI configuration may need attention."
+        )
+    return memory_calibration(await get_chatbot(org_id, chatbot_id))
+
+
 async def update_chatbot(org_id: UUID, chatbot_id: UUID, payload: ChatbotUpdate) -> Chatbot:
     updates = payload.model_dump(exclude_unset=True, exclude_none=True)
 
     # `exclude_none` is what makes this a partial patch, and it is right for every field
-    # whose null means "leave it alone". Four columns are the exceptions: null on the two
-    # retention windows means "keep forever" and null on the two usage caps means
-    # "unlimited", so dropping it would make each a one-way switch a tenant could never turn
-    # back off. Only a field the caller actually named is reinstated, so an omitted one still
-    # means no change.
+    # whose null means "leave it alone". Five columns are the exceptions: null on the two
+    # retention windows means "keep forever", null on the two usage caps means "unlimited",
+    # and null on the similarity override means "go back to the calibrated floor" — so
+    # dropping it would make each a one-way switch a tenant could never turn back off. Only a
+    # field the caller actually named is reinstated, so an omitted one still means no change.
     named = payload.model_dump(exclude_unset=True)
     for field in (
         "retention_days",
         "nuvrag_mem_retention_days",
+        "nuvrag_mem_similarity_override",
         "monthly_ingestion_unit_cap",
         "monthly_retrieval_call_cap",
     ):

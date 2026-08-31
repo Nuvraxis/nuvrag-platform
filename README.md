@@ -288,7 +288,6 @@ than internal service names.
 | `RETENTION_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run, so one backlog cannot starve other tenants |
 | `NUVRAG_MEM_ENABLED` | `true` | whether visitor memory is written and read at all — see [Visitor memory](#visitor-memory) |
 | `NUVRAG_MEM_RETRIEVAL_TOP_K` | `5` | notes put in front of the model per question |
-| `NUVRAG_MEM_RETRIEVAL_MIN_SIMILARITY` | `0.45` | higher than document retrieval's floor: an irrelevant "fact about you" is worse than an irrelevant passage |
 | `NUVRAG_MEM_EXTRACTION_WINDOW_MESSAGES` | `6` | how much recent conversation the extractor is shown |
 | `NUVRAG_MEM_MAX_ENTRIES_PER_EXTRACTION` | `3` | ceiling on what one turn may record |
 | `NUVRAG_MEM_DEDUPE_SIMILARITY` | `0.92` | above this a new note is a restatement and is dropped |
@@ -587,7 +586,8 @@ document context, marked untrusted, and outranked by the documents wherever the 
 Three things it deliberately does not do:
 
 - **No model runs at read time.** Retrieval is the same vector search the documents use, on
-  the same query vector — a second embedding call would buy an identical result.
+  the same query vector — a second embedding call would buy an identical result. (The one
+  exception is a chatbot's first-ever recall, which measures its threshold; see below.)
 - **Notes are never cited.** The `sources` event means "the passage this answer came from",
   and a remembered fact about a person is not a document.
 - **Nothing crosses a chatbot.** Notes are scoped to `(chatbot_id, subject_id)`, so the same
@@ -617,6 +617,54 @@ curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKE
 The clock runs from when a note was **last used to answer something**, not when it was
 learned, for the same reason a conversation ages on its last message. An **unresolved ticket
 pins** that visitor's notes however old they are, exactly as it pins their transcript.
+
+**How close is close enough.** A note is only recalled if it scores above a cosine
+similarity threshold against what the visitor just asked. That threshold is **measured per
+chatbot, against the embedding model that chatbot actually uses** — not shared, and not a
+constant. It cannot be one: how similar two things score is a property of the model, and every
+chatbot here picks its own embedding provider and model. The same note and the same questions,
+on two models:
+
+```
+nomic-embed-text (768d)      a paraphrase 0.542    unrelated questions 0.373-0.431
+qwen3-embedding:8b (4096d)   a paraphrase 0.720    unrelated questions 0.476-0.526
+```
+
+A floor of 0.45 divides those bands on the first model and sits below **both** on the second,
+where every unrelated question would recall every note — an assistant confidently telling
+someone something untrue about themselves. Which is why there is no such setting.
+
+Instead, a fixed set of sixteen sentence pairs — short first-person statements, each with a
+question that should recall it and an ordinary support question that should not — is embedded
+through the chatbot's own provider, and the threshold is placed between the two bands. It
+happens **once**, on the first recall for a chatbot that has none, and again after the
+embedding model changes; there is no scheduled job. If the two bands overlap, the threshold
+goes *above* the worst unrelated question rather than between them: a note wrongly forgotten
+costs a visitor one convenience, and a note wrongly recalled costs them the truth.
+
+The settings page shows the threshold in force, where it came from, and when it was measured,
+with a **Recalibrate now** button beside it. You can also set your own, which always wins and
+is never overwritten:
+
+```bash
+# read what the gate is currently doing
+curl "$API/api/v1/chatbots/$CHATBOT_ID/memory-calibration" -H "Authorization: Bearer $TOKEN"
+
+# measure it now instead of waiting for the next returning visitor
+curl -X POST "$API/api/v1/chatbots/$CHATBOT_ID/memory-calibration"   -H "Authorization: Bearer $TOKEN"
+
+# override it, and put it back
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json' -d '{"nuvrag_mem_similarity_override": 0.62}'
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json' -d '{"nuvrag_mem_similarity_override": null}'
+```
+
+**If the measurement cannot be taken** — the embedding provider is unreachable, a credential is
+wrong — that turn simply goes without memory, and nothing is stored, so the next message tries
+again. There is deliberately no fallback number: falling back to a shared constant is the
+thing this replaces. The visitor sees a normal answer either way.
+
+These calibration calls are **not** counted against [usage caps](#usage-caps). They are the
+platform sizing its own gate, once per chatbot, rather than anything a visitor asked for.
 
 **Erasing a visitor.** *Forget this visitor* on the ticket page, or:
 

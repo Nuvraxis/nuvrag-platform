@@ -12,6 +12,7 @@ from app.schemas.chatbot import (
     ChatbotSecret,
     ChatbotUpdate,
     EmbedSnippet,
+    MemoryCalibrationRead,
     UsagePeriodRead,
 )
 from app.schemas.common import Page
@@ -68,6 +69,23 @@ async def update_chatbot(
 @router.delete("/{chatbot_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_chatbot(chatbot_id: UUID, principal: RequireAdmin) -> None:
     await chatbot_service.delete_chatbot(principal.org_id, chatbot_id)
+
+
+@router.get("/{chatbot_id}/memory-calibration", response_model=MemoryCalibrationRead)
+async def memory_calibration(chatbot: OwnedChatbot) -> MemoryCalibrationRead:
+    """The similarity floor in force for this chatbot, and where it came from."""
+    return chatbot_service.memory_calibration(chatbot)
+
+
+@router.post("/{chatbot_id}/memory-calibration", response_model=MemoryCalibrationRead)
+async def recalibrate_memory(chatbot_id: UUID, principal: RequireAdmin) -> MemoryCalibrationRead:
+    """Measure the floor now instead of waiting for the next returning visitor.
+
+    Calls the chatbot's embedding provider once, which is what makes this a POST. It is the
+    same measurement the chat path takes lazily, and neither is charged against the usage
+    caps: this is the platform sizing its own gate, not tenant-facing traffic.
+    """
+    return await chatbot_service.recalibrate_memory(principal.org_id, chatbot_id)
 
 
 @router.post("/{chatbot_id}/rotate-secret", response_model=ChatbotSecret)

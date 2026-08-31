@@ -14,6 +14,8 @@ from app.models.chatbot import (
     NUVRAG_MEM_RETENTION_MIN_DAYS,
     RETENTION_MAX_DAYS,
     RETENTION_MIN_DAYS,
+    SIMILARITY_MAX,
+    SIMILARITY_MIN,
     USAGE_CAP_MAX,
     USAGE_CAP_MESSAGE_MAX_LENGTH,
     USAGE_CAP_MIN,
@@ -92,6 +94,29 @@ def nuvrag_mem_retention_field(*, default: int | None = NUVRAG_MEM_RETENTION_DEF
         ge=NUVRAG_MEM_RETENTION_MIN_DAYS,
         le=NUVRAG_MEM_RETENTION_MAX_DAYS,
         description=NUVRAG_MEM_RETENTION_DESCRIPTION,
+    )
+
+
+NUVRAG_MEM_SIMILARITY_DESCRIPTION = (
+    "Cosine similarity a remembered note must reach against the visitor's question before it "
+    "is recalled. Null means use the value calibrated against this chatbot's own embedding "
+    "model, which is the default and the recommended setting — a floor that is right for one "
+    "embedding model is generally wrong for another. Set it only to override that measurement."
+)
+
+
+def nuvrag_mem_similarity_field() -> Any:
+    """Null is a value on both models, so it carries no non-null default.
+
+    On create that is "let it be calibrated"; on patch it is also how an operator removes an
+    override they set earlier, which is why `update_chatbot` reinstates it after
+    `exclude_none` — the same treatment the retention windows and the usage caps need.
+    """
+    return Field(
+        default=None,
+        ge=SIMILARITY_MIN,
+        le=SIMILARITY_MAX,
+        description=NUVRAG_MEM_SIMILARITY_DESCRIPTION,
     )
 
 
@@ -192,6 +217,7 @@ class ChatbotCreate(BaseModel):
     theme_json: WidgetTheme = Field(default_factory=WidgetTheme)
     retention_days: int | None = retention_field()
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field()
+    nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
     monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
     monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
     usage_cap_message: str = Field(
@@ -228,6 +254,9 @@ class ChatbotUpdate(BaseModel):
     # Same treatment, same reason: null here is "keep memory forever", so it is
     # reinstated after `exclude_none` when the caller actually named it.
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field(default=None)
+    # And again: null here drops an override, putting the chatbot back on its calibrated
+    # floor. There is no field for the calibrated value itself — it is measured, not set.
+    nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
     # And again: null here removes a cap rather than leaving it alone.
     monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
     monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
@@ -261,6 +290,22 @@ class UsagePeriodRead(BaseModel):
     retrieval_calls_used: int
 
 
+class MemoryCalibrationRead(BaseModel):
+    """The similarity floor in force for one chatbot, and where it came from.
+
+    `effective_threshold` is derived rather than stored — an override wins over a
+    measurement — and is reported here so a caller does not have to re-implement that
+    precedence to know what the gate is actually doing. Null means no floor is known, which
+    is not a floor of zero: until one is measured, nothing is recalled at all.
+    """
+
+    effective_threshold: float | None
+    source: Literal["override", "calibrated", "uncalibrated"]
+    override: float | None
+    calibrated: float | None
+    calibrated_at: datetime | None
+
+
 class ChatbotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
 
@@ -275,6 +320,11 @@ class ChatbotRead(BaseModel):
     theme_json: dict[str, Any]
     retention_days: int | None
     nuvrag_mem_retention_days: int | None
+    nuvrag_mem_similarity_override: float | None
+    # Read-only: measured by the platform, never accepted from a client. Null means no
+    # calibration is on file for the embedding model currently configured.
+    nuvrag_mem_similarity_calibrated: float | None
+    nuvrag_mem_similarity_calibrated_at: datetime | None
     monthly_ingestion_unit_cap: int | None
     monthly_retrieval_call_cap: int | None
     usage_cap_message: str

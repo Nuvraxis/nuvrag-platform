@@ -378,6 +378,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/chatbots/{chatbot_id}/memory-calibration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Calibration
+         * @description The similarity floor in force for this chatbot, and where it came from.
+         */
+        get: operations["memory_calibration_api_v1_chatbots__chatbot_id__memory_calibration_get"];
+        put?: never;
+        /**
+         * Recalibrate Memory
+         * @description Measure the floor now instead of waiting for the next returning visitor.
+         *
+         *     Calls the chatbot's embedding provider once, which is what makes this a POST. It is the
+         *     same measurement the chat path takes lazily, and neither is charged against the usage
+         *     caps: this is the platform sizing its own gate, not tenant-facing traffic.
+         */
+        post: operations["recalibrate_memory_api_v1_chatbots__chatbot_id__memory_calibration_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/chatbots/{chatbot_id}/rotate-secret": {
         parameters: {
             query?: never;
@@ -815,6 +843,11 @@ export interface components {
              */
             nuvrag_mem_retention_days: number | null;
             /**
+             * Nuvrag Mem Similarity Override
+             * @description Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting — a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.
+             */
+            nuvrag_mem_similarity_override?: number | null;
+            /**
              * Privacy Url
              * @description Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.
              * @default
@@ -876,6 +909,12 @@ export interface components {
             name: string;
             /** Nuvrag Mem Retention Days */
             nuvrag_mem_retention_days: number | null;
+            /** Nuvrag Mem Similarity Calibrated */
+            nuvrag_mem_similarity_calibrated: number | null;
+            /** Nuvrag Mem Similarity Calibrated At */
+            nuvrag_mem_similarity_calibrated_at: string | null;
+            /** Nuvrag Mem Similarity Override */
+            nuvrag_mem_similarity_override: number | null;
             /**
              * Org Id
              * Format: uuid
@@ -949,6 +988,11 @@ export interface components {
              * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
              */
             nuvrag_mem_retention_days?: number | null;
+            /**
+             * Nuvrag Mem Similarity Override
+             * @description Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting — a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.
+             */
+            nuvrag_mem_similarity_override?: number | null;
             /** Privacy Url */
             privacy_url?: string | null;
             /**
@@ -1263,6 +1307,30 @@ export interface components {
             /** Is Active */
             is_active?: boolean | null;
             role?: components["schemas"]["UserRole"] | null;
+        };
+        /**
+         * MemoryCalibrationRead
+         * @description The similarity floor in force for one chatbot, and where it came from.
+         *
+         *     `effective_threshold` is derived rather than stored — an override wins over a
+         *     measurement — and is reported here so a caller does not have to re-implement that
+         *     precedence to know what the gate is actually doing. Null means no floor is known, which
+         *     is not a floor of zero: until one is measured, nothing is recalled at all.
+         */
+        MemoryCalibrationRead: {
+            /** Calibrated */
+            calibrated: number | null;
+            /** Calibrated At */
+            calibrated_at: string | null;
+            /** Effective Threshold */
+            effective_threshold: number | null;
+            /** Override */
+            override: number | null;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "override" | "calibrated" | "uncalibrated";
         };
         /**
          * MemoryNoteRead
@@ -2672,6 +2740,69 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EmbedSnippet"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_calibration_api_v1_chatbots__chatbot_id__memory_calibration_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Chatbot identifier */
+                chatbot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryCalibrationRead"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recalibrate_memory_api_v1_chatbots__chatbot_id__memory_calibration_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatbot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryCalibrationRead"];
                 };
             };
             /** @description Validation Error */

@@ -25,6 +25,7 @@ import type {
   InvitationStatus,
   LoginRequest,
   MemberUpdate,
+  MemoryCalibration,
   Message,
   Page,
   SignupRequest,
@@ -192,6 +193,15 @@ export class ApiClient {
 
   rotateSecret(chatbotId: string, options?: RequestOptions): Promise<ChatbotSecret> {
     return this.send('POST', `/api/v1/chatbots/${encode(chatbotId)}/rotate-secret`, options)
+  }
+
+  memoryCalibration(chatbotId: string, options?: RequestOptions): Promise<MemoryCalibration> {
+    return this.send('GET', `/api/v1/chatbots/${encode(chatbotId)}/memory-calibration`, options)
+  }
+
+  /** POST rather than GET: it calls the chatbot's embedding provider to take a measurement. */
+  recalibrateMemory(chatbotId: string, options?: RequestOptions): Promise<MemoryCalibration> {
+    return this.send('POST', `/api/v1/chatbots/${encode(chatbotId)}/memory-calibration`, options)
   }
 
   embedSnippet(chatbotId: string, options?: RequestOptions): Promise<EmbedSnippet> {

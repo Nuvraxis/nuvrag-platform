@@ -13,10 +13,12 @@ import math
 import os
 import uuid
 import zlib
+from datetime import UTC, datetime
 
 import pytest
 from app.db.session import check_database_health, dispose_engines
 from app.main import create_app
+from app.services.nuvrag_mem.calibration import CALIBRATION_PAIRS
 from app.services.redis_client import check_redis_health, close_redis
 from httpx import ASGITransport, AsyncClient
 from langchain_core.messages import HumanMessage
@@ -1877,9 +1879,38 @@ class _StubEmbeddings:
     def __init__(self, width: int, *, locked: int | None = None) -> None:
         self._width = width
         self.dimension = locked
+        self.batches: list[list[str]] = []
 
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str], *, attempts: int = 4) -> list[list[float]]:
+        self.batches.append(list(texts))
         return [_hash_embedding(text, self._width) for text in texts]
+
+
+# The floor the bag-of-words tests run against — what the platform used to ship as one
+# global constant. Their expectations were written to it: an exact echo scores 1.0 through
+# `_hash_embedding`, and a note with no words in common scores far below.
+_STUB_FLOOR = 0.45
+
+
+def _calibrated(floor: float):
+    """A chatbot whose similarity floor has already been measured.
+
+    Every test that calls `recall` directly to exercise something *else* — the ticket gate,
+    tenant scoping, top-k — passes one of these, so the floor is a fixed input rather than
+    whatever the bag-of-words stub happens to calibrate to.
+    """
+    from app.services.nuvrag_mem.calibration import CalibrationState
+
+    return CalibrationState(override=None, calibrated=floor, calibrated_at=datetime.now(UTC))
+
+
+class _RefusingEmbeddings:
+    """Fails the test if anything embeds. Passed wherever calibration must not run."""
+
+    dimension = 768
+
+    async def embed_batch(self, texts: list[str], *, attempts: int = 4) -> list[list[float]]:
+        raise AssertionError("calibration ran for a chatbot whose floor was already known")
 
 
 async def _ingest(client, token, org_id, chatbot_id, body: bytes, *, width: int, monkeypatch):
@@ -3609,10 +3640,13 @@ class TestVisitorMemoryReadPath:
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot["id"]),
                     subject_id=session_id,
                     embedding=_hash_embedding("Prefers email over the phone", 768),
                     dimension=768,
+                    state=_calibrated(_STUB_FLOOR),
+                    embedder=_RefusingEmbeddings(),
                 )
 
         assert len(await _recall()) == 1
@@ -3679,10 +3713,11 @@ class TestVisitorMemoryReadPath:
         assert "VISITOR MEMORY" not in _system_prompt(chat)
 
     async def test_the_similarity_floor_excludes_an_unrelated_note(self, client, monkeypatch):
-        """Both directions with the real default floor: an exact echo is recalled, a note with
-        no words in common is not. An irrelevant 'fact about you' is worse than a missing one,
-        which is why this floor sits above the document one."""
-        from app.core.config import settings
+        """Both directions at one floor: an exact echo is recalled, a note with no words in
+        common is not. An irrelevant 'fact about you' is worse than a missing one, which is
+        why this floor sits above the document one — and, since iteration 17, why it is
+        measured per chatbot rather than shared. The value here is supplied rather than
+        measured, because what this test is about is the comparison, not the number."""
         from app.db.session import tenant_session
         from app.services.nuvrag_mem import recall
 
@@ -3698,16 +3733,18 @@ class TestVisitorMemoryReadPath:
             "Prefers email over the phone",
             "Runs the EU West region",
         )
-        assert settings.nuvrag_mem.retrieval_min_similarity == 0.45
 
         async def _recall(question: str):
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot["id"]),
                     subject_id=session_id,
                     embedding=_hash_embedding(question, 768),
                     dimension=768,
+                    state=_calibrated(_STUB_FLOOR),
+                    embedder=_RefusingEmbeddings(),
                 )
 
         found = await _recall("Prefers email over the phone")
@@ -3726,17 +3763,20 @@ class TestVisitorMemoryReadPath:
             client, token, org_id, chatbot, monkeypatch, "alpha note", "bravo note", "charlie note"
         )
 
-        # The floor is what the previous test covers; this one is about the ceiling.
-        monkeypatch.setattr(settings.nuvrag_mem, "retrieval_min_similarity", 0.0)
+        # The floor is what the previous test covers; this one is about the ceiling, so it
+        # is dropped to zero and everything reaches the top-k cut.
         monkeypatch.setattr(settings.nuvrag_mem, "retrieval_top_k", 2)
 
         async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
             found = await recall(
                 session,
+                org_id=uuid.UUID(org_id),
                 chatbot_id=uuid.UUID(chatbot["id"]),
                 subject_id=session_id,
                 embedding=_hash_embedding("alpha note", 768),
                 dimension=768,
+                state=_calibrated(0.0),
+                embedder=_RefusingEmbeddings(),
             )
         assert len(found) == 2
         # Closest first, so a ceiling drops the least relevant rather than an arbitrary one.
@@ -3772,10 +3812,13 @@ class TestVisitorMemoryReadPath:
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot_id),
                     subject_id=session_id,
                     embedding=_hash_embedding("Prefers email over the phone", 768),
                     dimension=768,
+                    state=_calibrated(_STUB_FLOOR),
+                    embedder=_RefusingEmbeddings(),
                 )
 
         assert len(await _recall(support["id"])) == 1
@@ -3802,10 +3845,13 @@ class TestVisitorMemoryReadPath:
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot["id"]),
                     subject_id=subject_id,
                     embedding=_hash_embedding("Prefers email over the phone", 768),
                     dimension=768,
+                    state=_calibrated(_STUB_FLOOR),
+                    embedder=_RefusingEmbeddings(),
                 )
 
         # Identical wording, so only the subject can tell the two rows apart.
@@ -4257,10 +4303,13 @@ class TestTicketMemoryPanel:
             assert (
                 await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot["id"]),
                     subject_id=session_id,
                     embedding=_hash_embedding("totally different wording", 768),
                     dimension=768,
+                    state=_calibrated(_STUB_FLOOR),
+                    embedder=_RefusingEmbeddings(),
                 )
                 == []
             )
@@ -5403,6 +5452,634 @@ class TestRetrievalCap:
     _OLLAMA is None,
     reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
 )
+async def _calibration(client, token: str, chatbot_id: str) -> dict:
+    response = await client.get(
+        f"/api/v1/chatbots/{chatbot_id}/memory-calibration",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+async def _stored_calibration(org_id: str, chatbot_id: str) -> tuple[float | None, object]:
+    """The two calibration columns, read under the owning tenant's RLS context."""
+    from app.db.session import tenant_session
+    from sqlalchemy import text as sql_text
+
+    async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+        row = (
+            await session.execute(
+                sql_text(
+                    "SELECT nuvrag_mem_similarity_calibrated,"
+                    " nuvrag_mem_similarity_calibrated_at FROM chatbot WHERE id = :id"
+                ),
+                {"id": uuid.UUID(chatbot_id)},
+            )
+        ).first()
+    return (row[0], row[1])
+
+
+class TestMemoryCalibrationMath:
+    """Where the floor lands, given what the two kinds of question scored.
+
+    Pure arithmetic, deliberately separated from the embedding call so the decision can be
+    put under distributions no locally available model produces — including the two that
+    caused this iteration.
+    """
+
+    def test_clean_separation_puts_the_floor_between_the_bands(self):
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        result = threshold_from_scores([0.70, 0.75, 0.80], [0.30, 0.35, 0.40])
+
+        assert result.separated is True
+        assert result.threshold == pytest.approx(0.55)
+        assert result.max_distractor < result.threshold < result.min_paraphrase
+
+    def test_the_nomic_shaped_distribution_lands_between_its_bands(self):
+        """The model the 0.45 constant was calibrated for. Paraphrases around 0.54,
+        unrelated questions 0.37-0.43 — bands that separate, so the midpoint is honest and
+        the old constant happened to be close to right."""
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        paraphrase = [0.542, 0.561, 0.518, 0.574, 0.533, 0.549, 0.507, 0.566]
+        distractor = [0.373, 0.402, 0.431, 0.388, 0.417, 0.395, 0.408, 0.379]
+
+        result = threshold_from_scores(paraphrase, distractor)
+
+        assert result.separated is True
+        assert result.threshold == pytest.approx((0.507 + 0.431) / 2)
+        assert all(score > result.threshold for score in paraphrase)
+        assert all(score < result.threshold for score in distractor)
+
+    def test_the_qwen3_shaped_distribution_lands_between_its_bands_too(self):
+        """The model on the machine where the bug surfaced. Everything scores higher — the
+        *unrelated* band alone (0.476-0.526) sits above the 0.45 constant entirely, which is
+        why that constant admitted every unrelated question. The same rule, given the same
+        model's numbers, produces a floor around 0.6 instead.
+
+        The point is not that 0.6 is a better constant. It is that neither number is a
+        constant: this is the identical code path as the nomic case above, and the two
+        thresholds differ by more than the width of either band.
+        """
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        paraphrase = [0.720, 0.694, 0.751, 0.707, 0.733, 0.688, 0.742, 0.715]
+        distractor = [0.476, 0.501, 0.526, 0.489, 0.513, 0.494, 0.518, 0.482]
+
+        result = threshold_from_scores(paraphrase, distractor)
+
+        assert result.separated is True
+        assert result.threshold == pytest.approx((0.688 + 0.526) / 2)
+        assert all(score > result.threshold for score in paraphrase)
+        assert all(score < result.threshold for score in distractor)
+
+        # And the constant this iteration removes would have admitted every one of them.
+        assert all(score > 0.45 for score in distractor)
+
+    def test_two_models_do_not_share_a_floor(self):
+        """The claim the whole iteration rests on, stated as an assertion rather than prose:
+        run the same rule over two models' measurements and the answers are far enough apart
+        that either floor is wrong on the other model."""
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        nomic = threshold_from_scores(
+            [0.542, 0.561, 0.518, 0.574, 0.533, 0.549, 0.507, 0.566],
+            [0.373, 0.402, 0.431, 0.388, 0.417, 0.395, 0.408, 0.379],
+        )
+        qwen = threshold_from_scores(
+            [0.720, 0.694, 0.751, 0.707, 0.733, 0.688, 0.742, 0.715],
+            [0.476, 0.501, 0.526, 0.489, 0.513, 0.494, 0.518, 0.482],
+        )
+
+        # nomic's floor is below qwen's entire distractor band: it would admit them all.
+        assert nomic.threshold < qwen.max_distractor
+        # qwen's floor is above nomic's entire paraphrase band: it would recall nothing.
+        assert qwen.threshold > nomic.min_paraphrase
+
+    def test_overlapping_bands_go_above_the_worst_distractor(self):
+        """A model that cannot tell the two apart. There is no threshold that gets both kinds
+        right, so the choice is which error to make — and a fact wrongly recalled is worse
+        than one wrongly forgotten."""
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        paraphrase = [0.40, 0.55, 0.62]
+        distractor = [0.30, 0.45, 0.60]
+
+        result = threshold_from_scores(paraphrase, distractor)
+
+        assert result.separated is False
+        assert result.threshold > result.max_distractor
+        # Deliberately above two of the three paraphrases as well: conservative, not balanced.
+        assert result.threshold > 0.40
+        # margin = max - mean = 0.60 - 0.45
+        assert result.threshold == pytest.approx(0.60 + 0.15)
+
+    def test_a_flat_distractor_band_still_clears_it(self):
+        """`max - mean` is zero when every distractor scored the same, and a threshold *equal*
+        to the worst distractor would admit it — the comparison in the repository is `>=`."""
+        from app.services.nuvrag_mem.calibration import (
+            CALIBRATION_MIN_MARGIN,
+            threshold_from_scores,
+        )
+
+        result = threshold_from_scores([0.50, 0.50], [0.50, 0.50])
+
+        assert result.separated is False
+        assert result.threshold == pytest.approx(0.50 + CALIBRATION_MIN_MARGIN)
+        assert result.threshold > result.max_distractor
+
+    def test_the_threshold_stays_inside_the_column_bounds(self):
+        """A pathological model whose distractors reach 1.0 would otherwise produce a floor
+        the check constraint refuses to store."""
+        from app.services.nuvrag_mem.calibration import threshold_from_scores
+
+        result = threshold_from_scores([0.99], [1.0, 0.2])
+
+        assert result.threshold == 1.0
+
+    def test_the_cosine_ignores_how_long_the_vectors_are(self):
+        """A dot product would pass every test above, because the provider on this machine
+        happens to return unit vectors — and would then be wrong for one that does not.
+        pgvector's cosine distance normalises, so the measurement has to as well or the
+        threshold describes a different quantity than the comparison it feeds."""
+        from app.services.nuvrag_mem.calibration import _cosine
+
+        # Same direction, wildly different lengths: a dot product says 15, a cosine says 1.
+        assert _cosine([3.0, 0.0], [5.0, 0.0]) == pytest.approx(1.0)
+        assert _cosine([1.0, 0.0], [0.0, 2.0]) == pytest.approx(0.0)
+        assert _cosine([2.0, 2.0], [1.0, 0.0]) == pytest.approx(0.70710678)
+        # A zero vector has no direction; dividing by its length would raise instead.
+        assert _cosine([0.0, 0.0], [1.0, 0.0]) == 0.0
+
+    def test_the_pairs_are_shaped_like_the_notes_being_gated(self):
+        """The set calibrates for a distribution it has to resemble: short first-person
+        statements against questions, not arbitrary text."""
+        from app.services.nuvrag_mem.calibration import CALIBRATION_PAIRS
+
+        assert len(CALIBRATION_PAIRS) >= 8
+        for note, paraphrase, distractor in CALIBRATION_PAIRS:
+            assert note.startswith(("I ", "My ")), note
+            assert note.endswith("."), note
+            assert paraphrase.endswith("?"), paraphrase
+            assert distractor.endswith("?"), distractor
+
+
+class TestMemoryCalibrationTrigger:
+    """When the measurement is taken, and what happens when it cannot be."""
+
+    async def _seeded(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+        return token, org_id, chatbot, session_id
+
+    async def _recall(self, org_id, chatbot, session_id, *, embedder, question="Prefers email"):
+        """One recall attempt reading the chatbot's real, current calibration state."""
+        from app.db.session import tenant_session
+        from app.repositories import ChatbotRepository
+        from app.services.nuvrag_mem import recall
+        from app.services.nuvrag_mem.calibration import CalibrationState
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            row = await ChatbotRepository(session).get_for_org(
+                uuid.UUID(chatbot["id"]), uuid.UUID(org_id)
+            )
+            state = CalibrationState(
+                override=row.nuvrag_mem_similarity_override,
+                calibrated=row.nuvrag_mem_similarity_calibrated,
+                calibrated_at=row.nuvrag_mem_similarity_calibrated_at,
+            )
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            return await recall(
+                session,
+                org_id=uuid.UUID(org_id),
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                subject_id=session_id,
+                embedding=_hash_embedding(question, 768),
+                dimension=768,
+                state=state,
+                embedder=embedder,
+            )
+
+    async def test_the_first_recall_calibrates_and_the_second_does_not(self, client, monkeypatch):
+        """Lazy, like iteration 16's month rollover: no scheduled job, and the work happens on
+        the first request that needs it rather than for every chatbot on the platform."""
+        _token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        assert await _stored_calibration(org_id, chatbot["id"]) == (None, None)
+
+        embedder = _StubEmbeddings(768, locked=768)
+        await self._recall(org_id, chatbot, session_id, embedder=embedder)
+
+        calibrated, at = await _stored_calibration(org_id, chatbot["id"])
+        assert calibrated is not None
+        assert at is not None
+        assert len(embedder.batches) == 1, "calibration did not embed exactly one batch"
+
+        # Second turn: the floor is on the row, so nothing is embedded for it at all.
+        await self._recall(org_id, chatbot, session_id, embedder=_RefusingEmbeddings())
+        assert (await _stored_calibration(org_id, chatbot["id"])) == (calibrated, at)
+
+    async def test_an_override_is_never_recalculated_over(self, client, monkeypatch):
+        """An operator's number is a decision, not a starting guess. Nothing measures on top of
+        it, so a chatbot with an override never embeds the calibration set at all —
+        `_RefusingEmbeddings` fails the test if anything tries."""
+        token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        await _set_caps(client, token, chatbot["id"], nuvrag_mem_similarity_override=0.9)
+
+        found = await self._recall(org_id, chatbot, session_id, embedder=_RefusingEmbeddings())
+
+        # 0.9 is above what the bag-of-words stub scores for this question, so the override is
+        # visibly in force rather than merely stored.
+        assert found == []
+        assert await _stored_calibration(org_id, chatbot["id"]) == (None, None)
+        assert (await _calibration(client, token, chatbot["id"]))["source"] == "override"
+
+    async def test_an_override_beats_a_measurement_that_already_exists(self, client, monkeypatch):
+        """The precedence itself, which the test above cannot see: there, nothing had been
+        measured, so either ordering would have picked the override. Here both are on the row
+        and they disagree."""
+        token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        await self._recall(org_id, chatbot, session_id, embedder=_StubEmbeddings(768, locked=768))
+        calibrated, _at = await _stored_calibration(org_id, chatbot["id"])
+        assert calibrated is not None
+
+        # A partial echo, chosen to sit between the two floors: `_hash_embedding` scores three
+        # of the note's five words at 3 / sqrt(15) ~= 0.775.
+        question = "Prefers email over"
+        assert calibrated < 0.775 < 0.99, (
+            f"the measured floor ({calibrated:.3f}) no longer brackets this question, so the "
+            "two thresholds would agree and the test would prove nothing"
+        )
+
+        under_measurement = await self._recall(
+            org_id, chatbot, session_id, question=question, embedder=_RefusingEmbeddings()
+        )
+        assert [m.entry.content for m in under_measurement] == ["Prefers email over the phone"]
+
+        await _set_caps(client, token, chatbot["id"], nuvrag_mem_similarity_override=0.99)
+
+        under_override = await self._recall(
+            org_id, chatbot, session_id, question=question, embedder=_RefusingEmbeddings()
+        )
+        assert under_override == [], "the measurement was used while an override was set"
+
+        # And the measurement is still on file. An override hides it; it does not erase it,
+        # which is what lets clearing the override put the chatbot straight back on it.
+        state = await _calibration(client, token, chatbot["id"])
+        assert state["source"] == "override"
+        assert state["effective_threshold"] == 0.99
+        assert state["calibrated"] == calibrated
+
+    async def test_an_override_can_be_removed_again(self, client, monkeypatch):
+        """Null on a patch clears it rather than meaning "unchanged" — the same exception the
+        retention windows and the usage caps get, and what stops it being a one-way switch."""
+        token, _org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        await _set_caps(client, token, chatbot["id"], nuvrag_mem_similarity_override=0.72)
+        assert (await _calibration(client, token, chatbot["id"]))["override"] == 0.72
+
+        cleared = await _set_caps(client, token, chatbot["id"], nuvrag_mem_similarity_override=None)
+        assert cleared["nuvrag_mem_similarity_override"] is None
+        assert (await _calibration(client, token, chatbot["id"]))["source"] == "uncalibrated"
+
+    async def test_a_calibration_failure_skips_recall_and_retries_next_turn(
+        self, client, monkeypatch
+    ):
+        """The failure mode the brief cares most about. There is deliberately no default to
+        fall back on — a shared constant is the bug being fixed — so the turn goes without
+        memory and the column stays null so the next one tries again."""
+        _token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+
+        class _Unreachable:
+            dimension = 768
+
+            async def embed_batch(self, texts, *, attempts=4):
+                raise RuntimeError("the embedding provider is unreachable")
+
+        assert await self._recall(org_id, chatbot, session_id, embedder=_Unreachable()) == []
+        assert await _stored_calibration(org_id, chatbot["id"]) == (None, None)
+
+        # Nothing is poisoned: the very next attempt, with the provider back, calibrates.
+        found = await self._recall(
+            org_id, chatbot, session_id, embedder=_StubEmbeddings(768, locked=768)
+        )
+        assert [m.entry.content for m in found] == ["Prefers email over the phone"]
+        assert (await _stored_calibration(org_id, chatbot["id"]))[0] is not None
+
+    async def test_a_capped_out_provider_does_not_silence_the_answer_itself(
+        self, client, monkeypatch
+    ):
+        """Degraded, not broken: a chat turn whose calibration fails still answers, just
+        without any memory in the prompt. A visitor never sees this."""
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        session_id, _ = await _seeded_visitor(
+            client, token, org_id, chatbot, monkeypatch, "Prefers email over the phone"
+        )
+
+        class _EmbedsOnceThenFails:
+            """Serves the question's own vector, then refuses the calibration batch."""
+
+            dimension = 768
+
+            def __init__(self):
+                self.calls = 0
+
+            async def embed_batch(self, texts, *, attempts=4):
+                self.calls += 1
+                if len(texts) == 1:
+                    return [_hash_embedding(texts[0], 768)]
+                raise RuntimeError("the embedding provider went away mid-turn")
+
+        provider = _EmbedsOnceThenFails()
+        chat = _RecordingChat("Noted.")
+
+        async def _chat(*_args, **_kwargs):
+            return chat
+
+        async def _embeddings(*_args, **_kwargs):
+            return provider
+
+        monkeypatch.setattr("app.services.rag.factory.get_chat_provider", _chat)
+        monkeypatch.setattr("app.services.rag.factory.get_embedding_provider", _embeddings)
+
+        events = {}
+        async with client.stream(
+            "POST",
+            "/public/widget/chat",
+            headers={"X-Chatbot-Key": chatbot["public_key"], "Origin": TENANT_ORIGIN},
+            json={"message": "Prefers email over the phone", "session_id": session_id},
+        ) as response:
+            assert response.status_code == 200
+            name = None
+            async for line in response.aiter_lines():
+                if line.startswith("event:"):
+                    name = line[6:].strip()
+                elif line.startswith("data:") and name:
+                    events[name] = json.loads(line[5:].strip())
+
+        assert events["done"]["message_id"], "a failed calibration broke the answer"
+        assert provider.calls == 2, "calibration was not attempted"
+        assert "BEGIN VISITOR MEMORY" not in _system_prompt(chat)
+
+    async def test_the_widget_calibrates_once_across_two_turns(self, client, monkeypatch):
+        """Through the real chat path, where the floor is read from the cached widget config.
+
+        Storing a calibration without evicting that entry would leave the next turn reading
+        `calibrated: null` again — so a chatbot would measure its floor on every single
+        message until the cache TTL ran out. This is what proves it does not.
+        """
+        _token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+
+        provider = _StubEmbeddings(768, locked=768)
+
+        async def _embeddings(*_args, **_kwargs):
+            return provider
+
+        async def _chat(*_args, **_kwargs):
+            return _StubChat()
+
+        monkeypatch.setattr("app.services.rag.factory.get_chat_provider", _chat)
+        monkeypatch.setattr("app.services.rag.factory.get_embedding_provider", _embeddings)
+
+        async def _turn():
+            async with client.stream(
+                "POST",
+                "/public/widget/chat",
+                headers={"X-Chatbot-Key": chatbot["public_key"], "Origin": TENANT_ORIGIN},
+                json={"message": "Prefers email over the phone", "session_id": session_id},
+            ) as response:
+                assert response.status_code == 200
+                async for _line in response.aiter_lines():
+                    pass
+
+        # The question's own vector, then one batch for the whole calibration set — the notes,
+        # their paraphrases and their distractors, which is three texts per pair.
+        calibration_batch = 3 * len(CALIBRATION_PAIRS)
+
+        await _turn()
+        assert [len(batch) for batch in provider.batches] == [1, calibration_batch]
+
+        await _turn()
+        assert [len(batch) for batch in provider.batches] == [1, calibration_batch, 1], (
+            "the second turn calibrated again, so the cached config was never evicted"
+        )
+        assert (await _stored_calibration(org_id, chatbot["id"]))[0] is not None
+
+    async def test_changing_the_embedding_model_clears_the_calibration(self, client, monkeypatch):
+        """A cosine floor describes one model. Carrying it across to another is the bug in
+        miniature, so the save that moves the model drops the measurement with it."""
+        token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        await self._recall(org_id, chatbot, session_id, embedder=_StubEmbeddings(768, locked=768))
+        assert (await _stored_calibration(org_id, chatbot["id"]))[0] is not None
+
+        await _configure_ai(client, token, chatbot["id"], embedding_model="a-different-model")
+
+        assert await _stored_calibration(org_id, chatbot["id"]) == (None, None)
+        assert (await _calibration(client, token, chatbot["id"]))["source"] == "uncalibrated"
+
+    async def test_changing_only_the_chat_model_keeps_it(self, client, monkeypatch):
+        """The floor is a property of the *embedding* model. Swapping the chat model has
+        nothing to do with it, and throwing the measurement away would cost a needless
+        provider call for no reason."""
+        token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        await self._recall(org_id, chatbot, session_id, embedder=_StubEmbeddings(768, locked=768))
+        before = await _stored_calibration(org_id, chatbot["id"])
+        assert before[0] is not None
+
+        await _configure_ai(client, token, chatbot["id"], chat_model="a-different-chat-model")
+
+        assert await _stored_calibration(org_id, chatbot["id"]) == before
+
+    async def test_calibration_is_not_charged_against_the_usage_caps(self, client, monkeypatch):
+        """Iteration 16's counters model tenant-facing ingestion and answer volume. A
+        calibration is the platform sizing its own gate — system-initiated, once per chatbot
+        — so metering it would misreport what a tenant actually spent."""
+        token, org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+        before = await _usage_row(org_id, chatbot["id"])
+
+        await self._recall(org_id, chatbot, session_id, embedder=_StubEmbeddings(768, locked=768))
+        assert await _usage_row(org_id, chatbot["id"]) == before
+
+        # And the same for the manual action, which is the other way a calibration happens.
+        await client.post(
+            f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert await _usage_row(org_id, chatbot["id"]) == before
+
+    async def test_iteration_14s_memory_block_is_untouched(self, client, monkeypatch):
+        """This iteration changes which notes are recalled and nothing about how a recalled
+        note is presented. The fence, its label and its rules are the earlier fix and stay
+        exactly as they were."""
+        _token, _org_id, chatbot, session_id = await self._seeded(client, monkeypatch)
+
+        chat = _RecordingChat("Noted.")
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            session_id,
+            locked=768,
+            chat=chat,
+            question="Prefers email over the phone",
+        )
+        system = _system_prompt(chat)
+
+        assert "===== BEGIN VISITOR MEMORY (untrusted, from earlier visits) =====" in system
+        assert "===== END VISITOR MEMORY =====" in system
+        assert "- (preference) Prefers email over the phone" in system
+        assert system.index("END CONTEXT") < system.index("BEGIN VISITOR MEMORY")
+        assert "the CONTEXT block is right" in system
+        assert "Never cite a note with a [n] marker" in system
+
+
+class TestMemoryCalibrationApi:
+    """The override, the readout and the manual action."""
+
+    async def test_a_new_chatbot_starts_uncalibrated_rather_than_at_a_default(self, client):
+        """The state that makes the first recall measure. Null here is not a floor of zero —
+        it is 'nothing is known yet', and until it is, nothing is recalled."""
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        assert chatbot["nuvrag_mem_similarity_override"] is None
+        assert chatbot["nuvrag_mem_similarity_calibrated"] is None
+        assert chatbot["nuvrag_mem_similarity_calibrated_at"] is None
+
+        state = await _calibration(client, token, chatbot["id"])
+        assert state == {
+            "effective_threshold": None,
+            "source": "uncalibrated",
+            "override": None,
+            "calibrated": None,
+            "calibrated_at": None,
+        }
+
+    async def test_an_override_can_be_set_at_creation(self, client):
+        token, _ = await _signup(client)
+        created = (
+            await client.post(
+                "/api/v1/chatbots",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"name": "Overridden", "nuvrag_mem_similarity_override": 0.65},
+            )
+        ).json()["chatbot"]
+
+        assert created["nuvrag_mem_similarity_override"] == 0.65
+        state = await _calibration(client, token, created["id"])
+        assert state["source"] == "override"
+        assert state["effective_threshold"] == 0.65
+
+    async def test_a_nonsense_override_is_refused(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        for value in (-0.1, 1.5):
+            response = await client.patch(
+                f"/api/v1/chatbots/{chatbot['id']}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"nuvrag_mem_similarity_override": value},
+            )
+            assert response.status_code == 422, value
+
+    async def test_the_database_refuses_it_too(self, client):
+        """The API's bounds are one layer. A cosine floor outside [0, 1] is meaningless to the
+        comparison it feeds, so the column says so as well."""
+        from app.db.session import tenant_session
+        from sqlalchemy import text as sql_text
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+
+        with pytest.raises(Exception) as caught:
+            async with tenant_session(uuid.UUID(org_id)) as session:
+                await session.execute(
+                    sql_text(
+                        "UPDATE chatbot SET nuvrag_mem_similarity_override = 2.0 WHERE id = :id"
+                    ),
+                    {"id": uuid.UUID(chatbot["id"])},
+                )
+        assert "ck_chatbot_nuvrag_mem_similarity_override" in str(caught.value)
+
+    async def test_the_manual_action_measures_now(self, client, monkeypatch):
+        """For an operator who has just changed embedding models and does not want to wait for
+        a returning visitor to find out whether the new one works."""
+        from app.services.ai import factory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        async def _stub(*_args, **_kwargs):
+            return _StubEmbeddings(768, locked=768)
+
+        monkeypatch.setattr(factory, "get_embedding_provider", _stub)
+
+        response = await client.post(
+            f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["source"] == "calibrated"
+        assert body["effective_threshold"] == body["calibrated"]
+        assert body["calibrated_at"] is not None
+        assert (await _stored_calibration(org_id, chatbot["id"]))[0] == body["calibrated"]
+
+    async def test_the_manual_action_reports_a_provider_it_cannot_reach(self, client, monkeypatch):
+        """An operator pressed the button and is watching it, so this is an error rather than
+        the chat path's silent degradation."""
+        from app.services.ai import factory
+
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        async def _broken(*_args, **_kwargs):
+            raise RuntimeError("no route to the embedding provider")
+
+        monkeypatch.setattr(factory, "get_embedding_provider", _broken)
+
+        response = await client.post(
+            f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 502, response.text
+        assert "embedding provider" in response.json()["error"]["message"]
+
+    async def test_a_member_cannot_recalibrate(self, client):
+        """Same authority as every other write on a chatbot: measuring spends a provider call
+        the organisation pays for."""
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        joined = await _join(client, await _invite(client, token, _address(), role="member"))
+
+        response = await client.post(
+            f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+            headers={"Authorization": f"Bearer {joined['tokens']['access_token']}"},
+        )
+        assert response.status_code == 403, response.text
+
+    async def test_another_tenant_cannot_read_a_calibration(self, client):
+        token, _ = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        intruder, _ = await _signup(client)
+
+        response = await client.get(
+            f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+            headers={"Authorization": f"Bearer {intruder}"},
+        )
+        assert response.status_code == 404, response.text
+
+
 class TestVisitorMemoryAgainstOllama:
     """The write path with nothing stubbed out.
 
@@ -5476,25 +6153,28 @@ class TestVisitorMemoryAgainstOllama:
         )
         assert [table for _, table in placements] == [expected]
 
-    async def test_a_paraphrase_ranks_above_an_unrelated_question(self, client, monkeypatch):
-        """Real semantic recall, which the bag-of-words stub cannot express.
+    async def test_the_calibrated_floor_separates_a_paraphrase_from_an_unrelated_question(
+        self, client, monkeypatch
+    ):
+        """The whole of iteration 17, measured end to end on a real embedding model.
 
-        Asserts the *ranking* rather than the absolute floor, because only the ranking holds
-        across embedding models. Two measured examples, same note and same questions:
+        Iteration 16 could assert only the *ranking* here, because the shipped 0.45 floor was
+        calibrated against nomic-embed-text and this machine serves whatever it serves. Two
+        measurements of the same note and the same questions:
 
-            nomic-embed-text (768d)   paraphrase 0.542  unrelated 0.373-0.431
+            nomic-embed-text (768d)    paraphrase 0.542  unrelated 0.373-0.431
             qwen3-embedding:8b (4096d) paraphrase 0.720  unrelated 0.476-0.526
 
-        The shipped 0.45 default sits cleanly between the two bands on the first model and
-        below *both* on the second, where it would admit an unrelated note — the exact failure
-        the higher floor exists to prevent. `NUVRAG_MEM_RETRIEVAL_MIN_SIMILARITY` therefore
-        has to be calibrated against whichever model a deployment actually runs, which is why
-        it is a setting; see the open checklist item.
+        0.45 sits between the bands on the first model and below *both* on the second, where
+        it admits an unrelated note — the exact failure a floor exists to prevent. A floor
+        measured against the model actually in play can assert the thing that matters rather
+        than the thing that merely survives: the paraphrase clears it and the unrelated
+        question does not, whichever of those two models — or any other — is configured.
         """
-        from app.core.config import settings
         from app.db.session import tenant_session
         from app.services.ai import factory
         from app.services.nuvrag_mem import extract_visitor_memory, recall
+        from app.services.nuvrag_mem.calibration import calibrate
 
         chat_model, embedding_model = _OLLAMA
         token, org_id = await _signup(client)
@@ -5520,30 +6200,54 @@ class TestVisitorMemoryAgainstOllama:
 
         embedder = await factory.get_embedding_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
 
-        async def _recall(question: str, *, floor: float | None = None):
+        async def _recall(question: str, floor: float):
             vector = (await embedder.embed_batch([question]))[0]
-            if floor is not None:
-                monkeypatch.setattr(settings.nuvrag_mem, "retrieval_min_similarity", floor)
             async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
                 return await recall(
                     session,
+                    org_id=uuid.UUID(org_id),
                     chatbot_id=uuid.UUID(chatbot["id"]),
                     subject_id=session_id,
                     embedding=vector,
                     dimension=width,
+                    state=_calibrated(floor),
+                    embedder=_RefusingEmbeddings(),
                 )
 
         async def _closeness(question: str) -> float:
-            found = await _recall(question, floor=0.0)
+            found = await _recall(question, 0.0)
             assert found, "the note was not returned at all, so nothing here is measurable"
             return found[0].similarity
 
-        paraphrase = await _closeness("What is the best way to get in touch with you?")
-        unrelated = await _closeness("How do I reset a forgotten password?")
+        paraphrase_question = "What is the best way to get in touch with you?"
+        unrelated_question = "How do I reset a forgotten password?"
+        paraphrase = await _closeness(paraphrase_question)
+        unrelated = await _closeness(unrelated_question)
 
         assert paraphrase > unrelated, (
             f"a paraphrase of what the visitor said ({paraphrase:.3f}) did not rank above an "
             f"unrelated question ({unrelated:.3f})"
         )
-        # And the shipped floor still admits the paraphrase, whatever it does at the bottom.
-        assert await _recall("What is the best way to get in touch with you?")
+
+        # Now the part iteration 16 could not assert. Measured against this model rather than
+        # assumed, the floor has to land between the two bands.
+        floor = await calibrate(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+        assert floor is not None, "calibration could not reach the embedding provider"
+
+        assert await _recall(paraphrase_question, floor), (
+            f"the calibrated floor {floor:.3f} refused a paraphrase scoring {paraphrase:.3f}"
+        )
+        assert await _recall(unrelated_question, floor) == [], (
+            f"the calibrated floor {floor:.3f} admitted an unrelated question scoring "
+            f"{unrelated:.3f}"
+        )
+
+        # And it was written to the row, not merely returned.
+        stored = (
+            await client.get(
+                f"/api/v1/chatbots/{chatbot['id']}/memory-calibration",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()
+        assert stored["source"] == "calibrated"
+        assert stored["effective_threshold"] == pytest.approx(floor)
