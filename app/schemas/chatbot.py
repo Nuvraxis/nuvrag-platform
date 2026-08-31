@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 from urllib.parse import urlparse
 from uuid import UUID
@@ -7,13 +7,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import ChatbotStatus
 from app.models.chatbot import (
+    DEFAULT_USAGE_CAP_MESSAGE,
     LINK_MAX_LENGTH,
     NUVRAG_MEM_RETENTION_DEFAULT_DAYS,
     NUVRAG_MEM_RETENTION_MAX_DAYS,
     NUVRAG_MEM_RETENTION_MIN_DAYS,
     RETENTION_MAX_DAYS,
     RETENTION_MIN_DAYS,
+    SIMILARITY_MAX,
+    SIMILARITY_MIN,
+    USAGE_CAP_MAX,
+    USAGE_CAP_MESSAGE_MAX_LENGTH,
+    USAGE_CAP_MIN,
 )
+from app.services.usage import INGESTION_UNIT_BYTES
 
 
 def validate_link(value: str) -> str:
@@ -90,6 +97,29 @@ def nuvrag_mem_retention_field(*, default: int | None = NUVRAG_MEM_RETENTION_DEF
     )
 
 
+NUVRAG_MEM_SIMILARITY_DESCRIPTION = (
+    "Cosine similarity a remembered note must reach against the visitor's question before it "
+    "is recalled. Null means use the value calibrated against this chatbot's own embedding "
+    "model, which is the default and the recommended setting — a floor that is right for one "
+    "embedding model is generally wrong for another. Set it only to override that measurement."
+)
+
+
+def nuvrag_mem_similarity_field() -> Any:
+    """Null is a value on both models, so it carries no non-null default.
+
+    On create that is "let it be calibrated"; on patch it is also how an operator removes an
+    override they set earlier, which is why `update_chatbot` reinstates it after
+    `exclude_none` — the same treatment the retention windows and the usage caps need.
+    """
+    return Field(
+        default=None,
+        ge=SIMILARITY_MIN,
+        le=SIMILARITY_MAX,
+        description=NUVRAG_MEM_SIMILARITY_DESCRIPTION,
+    )
+
+
 def _validate_origins(value: list[str]) -> list[str]:
     """Origins are compared against the browser's `Origin` header, which is always
     scheme://host[:port] with no path or trailing slash."""
@@ -141,6 +171,34 @@ class WidgetTheme(BaseModel):
     greeting: str | None = Field(default=None, max_length=300)
 
 
+USAGE_CAP_DESCRIPTIONS = {
+    "monthly_ingestion_unit_cap": (
+        "Ingestion units allowed per UTC calendar month, where one unit is "
+        f"{INGESTION_UNIT_BYTES} bytes of uploaded document, rounded up. Null is unlimited, "
+        "which is the default."
+    ),
+    "monthly_retrieval_call_cap": (
+        "Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null "
+        "is unlimited, which is the default."
+    ),
+}
+
+
+def usage_cap_field(column: str) -> Any:
+    """Null means unlimited on both models, so neither carries a non-null default.
+
+    On create that is the value a chatbot starts at; on patch it is also the instruction to
+    remove a cap, which is why `update_chatbot` reinstates it after `exclude_none` — the same
+    treatment the two retention columns need, for the same reason.
+    """
+    return Field(
+        default=None,
+        ge=USAGE_CAP_MIN,
+        le=USAGE_CAP_MAX,
+        description=USAGE_CAP_DESCRIPTIONS[column],
+    )
+
+
 class GenerationConfig(BaseModel):
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=64, le=8192)
@@ -159,6 +217,12 @@ class ChatbotCreate(BaseModel):
     theme_json: WidgetTheme = Field(default_factory=WidgetTheme)
     retention_days: int | None = retention_field()
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field()
+    nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
+    monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
+    monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
+    usage_cap_message: str = Field(
+        default=DEFAULT_USAGE_CAP_MESSAGE, max_length=USAGE_CAP_MESSAGE_MAX_LENGTH
+    )
     privacy_url: str = link_field(PRIVACY_DESCRIPTION)
     terms_url: str = link_field(TERMS_DESCRIPTION)
 
@@ -190,6 +254,15 @@ class ChatbotUpdate(BaseModel):
     # Same treatment, same reason: null here is "keep memory forever", so it is
     # reinstated after `exclude_none` when the caller actually named it.
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field(default=None)
+    # And again: null here drops an override, putting the chatbot back on its calibrated
+    # floor. There is no field for the calibrated value itself — it is measured, not set.
+    nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
+    # And again: null here removes a cap rather than leaving it alone.
+    monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
+    monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
+    # Not reinstated, because null means nothing here — the column is not nullable, so an
+    # omitted message is simply unchanged.
+    usage_cap_message: str | None = Field(default=None, max_length=USAGE_CAP_MESSAGE_MAX_LENGTH)
     # `None` is "unchanged" and `""` is "remove the link", the same split as `description`.
     privacy_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
     terms_url: str | None = Field(default=None, max_length=LINK_MAX_LENGTH)
@@ -207,6 +280,32 @@ class ChatbotUpdate(BaseModel):
         return None if value is None else validate_link(value)
 
 
+class UsagePeriodRead(BaseModel):
+    """This month's running totals. Absent until the month's first charge."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    period_start: date
+    ingestion_units_used: int
+    retrieval_calls_used: int
+
+
+class MemoryCalibrationRead(BaseModel):
+    """The similarity floor in force for one chatbot, and where it came from.
+
+    `effective_threshold` is derived rather than stored — an override wins over a
+    measurement — and is reported here so a caller does not have to re-implement that
+    precedence to know what the gate is actually doing. Null means no floor is known, which
+    is not a floor of zero: until one is measured, nothing is recalled at all.
+    """
+
+    effective_threshold: float | None
+    source: Literal["override", "calibrated", "uncalibrated"]
+    override: float | None
+    calibrated: float | None
+    calibrated_at: datetime | None
+
+
 class ChatbotRead(BaseModel):
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
 
@@ -221,6 +320,17 @@ class ChatbotRead(BaseModel):
     theme_json: dict[str, Any]
     retention_days: int | None
     nuvrag_mem_retention_days: int | None
+    nuvrag_mem_similarity_override: float | None
+    # Read-only: measured by the platform, never accepted from a client. Null means no
+    # calibration is on file for the embedding model currently configured.
+    nuvrag_mem_similarity_calibrated: float | None
+    nuvrag_mem_similarity_calibrated_at: datetime | None
+    monthly_ingestion_unit_cap: int | None
+    monthly_retrieval_call_cap: int | None
+    usage_cap_message: str
+    # Filled in by the detail endpoint only. The list endpoint leaves it null rather than
+    # paying for a usage lookup per row, which is the N+1 this field would otherwise be.
+    usage: UsagePeriodRead | None = None
     privacy_url: str
     terms_url: str
     public_key: str

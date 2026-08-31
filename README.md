@@ -288,7 +288,6 @@ than internal service names.
 | `RETENTION_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run, so one backlog cannot starve other tenants |
 | `NUVRAG_MEM_ENABLED` | `true` | whether visitor memory is written and read at all — see [Visitor memory](#visitor-memory) |
 | `NUVRAG_MEM_RETRIEVAL_TOP_K` | `5` | notes put in front of the model per question |
-| `NUVRAG_MEM_RETRIEVAL_MIN_SIMILARITY` | `0.45` | higher than document retrieval's floor: an irrelevant "fact about you" is worse than an irrelevant passage |
 | `NUVRAG_MEM_EXTRACTION_WINDOW_MESSAGES` | `6` | how much recent conversation the extractor is shown |
 | `NUVRAG_MEM_MAX_ENTRIES_PER_EXTRACTION` | `3` | ceiling on what one turn may record |
 | `NUVRAG_MEM_DEDUPE_SIMILARITY` | `0.92` | above this a new note is a restatement and is dropped |
@@ -296,6 +295,7 @@ than internal service names.
 | `NUVRAG_MEM_PURGE_HOUR_UTC` / `_MINUTE_UTC` | `3` / `45` | its own slot, and its own Redis lock |
 | `NUVRAG_MEM_PURGE_BATCH_SIZE` | `500` | notes deleted per transaction |
 | `NUVRAG_MEM_PURGE_MAX_BATCHES_PER_CHATBOT` | `40` | a ceiling per run |
+| `USAGE_CAP_FAIL_CLOSED` | `false` | what to do when the counters cannot be read — see [Usage caps](#usage-caps). *How much* a chatbot may spend is per chatbot, in the database |
 | `RATE_LIMIT_ENABLED` | `true` | |
 | `RATE_LIMIT_CHATBOT_CAPACITY` / `_REFILL_PER_SECOND` | `120` / `2.0` | per chatbot |
 | `RATE_LIMIT_SESSION_CAPACITY` / `_REFILL_PER_SECOND` | `20` / `0.25` | per widget session — the session id is browser-generated, so this shapes traffic rather than stopping abuse |
@@ -586,7 +586,8 @@ document context, marked untrusted, and outranked by the documents wherever the 
 Three things it deliberately does not do:
 
 - **No model runs at read time.** Retrieval is the same vector search the documents use, on
-  the same query vector — a second embedding call would buy an identical result.
+  the same query vector — a second embedding call would buy an identical result. (The one
+  exception is a chatbot's first-ever recall, which measures its threshold; see below.)
 - **Notes are never cited.** The `sources` event means "the passage this answer came from",
   and a remembered fact about a person is not a document.
 - **Nothing crosses a chatbot.** Notes are scoped to `(chatbot_id, subject_id)`, so the same
@@ -617,6 +618,54 @@ The clock runs from when a note was **last used to answer something**, not when 
 learned, for the same reason a conversation ages on its last message. An **unresolved ticket
 pins** that visitor's notes however old they are, exactly as it pins their transcript.
 
+**How close is close enough.** A note is only recalled if it scores above a cosine
+similarity threshold against what the visitor just asked. That threshold is **measured per
+chatbot, against the embedding model that chatbot actually uses** — not shared, and not a
+constant. It cannot be one: how similar two things score is a property of the model, and every
+chatbot here picks its own embedding provider and model. The same note and the same questions,
+on two models:
+
+```
+nomic-embed-text (768d)      a paraphrase 0.542    unrelated questions 0.373-0.431
+qwen3-embedding:8b (4096d)   a paraphrase 0.720    unrelated questions 0.476-0.526
+```
+
+A floor of 0.45 divides those bands on the first model and sits below **both** on the second,
+where every unrelated question would recall every note — an assistant confidently telling
+someone something untrue about themselves. Which is why there is no such setting.
+
+Instead, a fixed set of sixteen sentence pairs — short first-person statements, each with a
+question that should recall it and an ordinary support question that should not — is embedded
+through the chatbot's own provider, and the threshold is placed between the two bands. It
+happens **once**, on the first recall for a chatbot that has none, and again after the
+embedding model changes; there is no scheduled job. If the two bands overlap, the threshold
+goes *above* the worst unrelated question rather than between them: a note wrongly forgotten
+costs a visitor one convenience, and a note wrongly recalled costs them the truth.
+
+The settings page shows the threshold in force, where it came from, and when it was measured,
+with a **Recalibrate now** button beside it. You can also set your own, which always wins and
+is never overwritten:
+
+```bash
+# read what the gate is currently doing
+curl "$API/api/v1/chatbots/$CHATBOT_ID/memory-calibration" -H "Authorization: Bearer $TOKEN"
+
+# measure it now instead of waiting for the next returning visitor
+curl -X POST "$API/api/v1/chatbots/$CHATBOT_ID/memory-calibration"   -H "Authorization: Bearer $TOKEN"
+
+# override it, and put it back
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json' -d '{"nuvrag_mem_similarity_override": 0.62}'
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json' -d '{"nuvrag_mem_similarity_override": null}'
+```
+
+**If the measurement cannot be taken** — the embedding provider is unreachable, a credential is
+wrong — that turn simply goes without memory, and nothing is stored, so the next message tries
+again. There is deliberately no fallback number: falling back to a shared constant is the
+thing this replaces. The visitor sees a normal answer either way.
+
+These calibration calls are **not** counted against [usage caps](#usage-caps). They are the
+platform sizing its own gate, once per chatbot, rather than anything a visitor asked for.
+
 **Erasing a visitor.** *Forget this visitor* on the ticket page, or:
 
 ```bash
@@ -639,6 +688,83 @@ keeps their notes and simply stops being recognised until they escalate again.
 deployment. It runs at 03:45 UTC by default, fifteen minutes after the conversation sweep, and
 never shares its Redis lock — one key for two sweeps would let whichever ran first silently
 skip the other.
+
+## Usage caps
+
+Every ingestion and every answer spends money with whichever AI provider the tenant configured
+— and until this existed, nothing bounded that. The rate limiter shapes requests per second and
+forgets them a minute later; a chatbot can sit well inside its token bucket and still burn a
+month's budget. **Usage caps** are the other half: a ceiling on cumulative spend per chatbot per
+UTC calendar month.
+
+They are **off by default**. Both caps start null, which means unlimited, and a null cap never
+touches the counter at all.
+
+Two counters, set on the chatbot's settings page or over the API:
+
+| | What one unit is | What happens past the ceiling |
+|---|---|---|
+| `monthly_ingestion_unit_cap` | 4,000 bytes of uploaded document, rounded up — a 40 KB file costs 10 | the upload is refused with `429` |
+| `monthly_retrieval_call_cap` | one answered chat turn | the widget still replies, with your wording, and **no provider call is made** |
+
+```bash
+# 50,000 ingestion units and 10,000 answers a month
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"monthly_ingestion_unit_cap": 50000, "monthly_retrieval_call_cap": 10000}'
+
+# back to unlimited
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"monthly_ingestion_unit_cap": null, "monthly_retrieval_call_cap": null}'
+```
+
+`null` removes a cap rather than meaning "leave it alone" — the same exception the two retention
+fields get, and what stops a cap being a switch you can turn on and never off.
+
+**A capped chatbot still answers.** It returns `usage_cap_message` — yours to write, and worded
+by default to say nothing about limits or billing, because a visitor can only act on the part
+that concerns them. The turn is written to the transcript like any other, so the conversation
+does not have a hole in it, and the answer carries the same "talk to a human" offer a
+grounding miss does. What it does **not** do is fall back to an ungrounded answer: that would
+still spend the money the cap exists to save.
+
+**Refused uploads** answer `429` with the current total and the ceiling in `details`:
+
+```json
+{"error": {"code": "usage_cap_exceeded",
+           "message": "This chatbot has reached its monthly ingestion limit...",
+           "details": {"kind": "ingestion", "used": 50000, "cap": 50000}}}
+```
+
+There is no `Retry-After`: the wait is until the calendar turns over, not a number of seconds.
+
+**When the counters cannot be reached** — Postgres down, or unreachable — the cap status is
+unknown, and the default is to **let the request through**. A transient blip silencing every
+widget on the platform is worse than a bounded amount of uncounted spend during it, and the
+outage hiding the counters is generally also stopping the work being counted. This is the one
+judgement here an operator can flip:
+
+```bash
+USAGE_CAP_FAIL_CLOSED=true   # refuse instead, when the counters cannot be read
+```
+
+Both enforcement points read that one setting, so uploads and answers can never disagree about
+it.
+
+**A note on precision.** An upload's true cost is not known until it has been streamed, because
+the unit is derived from the file's size. So a chatbot already at its ceiling is refused before
+a byte moves, and the exact charge is settled after — which means one upload that *started*
+under the cap can carry it past, by at most one document's worth (25 MB, or 6,554 units). Every
+subsequent upload is refused. Answers have no such gap: a turn costs exactly one.
+
+**Nothing is backfilled.** Counters start at zero for every chatbot when this ships, whatever
+volume is already ingested — a cap is a ceiling on what happens next.
+
+Current usage is on the settings page and in `GET /api/v1/chatbots/{id}` as `usage`. The list
+endpoint leaves it null rather than doing a lookup per row. A cap being hit is counted as
+`rag_usage_cap_blocks_total` and logged as `usage_cap.blocked`; nobody is emailed, because
+there is no mail transport in this deployment.
 
 ## Keeping spam out of the ticket queue
 

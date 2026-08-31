@@ -15,6 +15,7 @@ from app.core.exceptions import (
 from app.core.logging import get_logger
 from app.db.session import system_session
 from app.models import ChatbotStatus
+from app.models.chatbot import DEFAULT_USAGE_CAP_MESSAGE
 from app.repositories import ChatbotRepository
 from app.schemas.chatbot import WidgetTheme, validate_link
 from app.services.cache import ChatbotConfigCache
@@ -77,6 +78,10 @@ async def resolve_chatbot(public_key: str) -> dict:
         "privacy_url": chatbot.privacy_url,
         "terms_url": chatbot.terms_url,
         "status": str(chatbot.status),
+        "monthly_retrieval_call_cap": chatbot.monthly_retrieval_call_cap,
+        "usage_cap_message": chatbot.usage_cap_message,
+        "nuvrag_mem_similarity_override": chatbot.nuvrag_mem_similarity_override,
+        "nuvrag_mem_similarity_calibrated": chatbot.nuvrag_mem_similarity_calibrated,
     }
 
 
@@ -194,6 +199,17 @@ def build_session(config: dict, allowed_origin: str) -> WidgetSession:
             chatbot_id=UUID(config["id"]),
             system_prompt=config.get("system_prompt") or "",
             generation_config=config.get("model_config_json") or {},
+            # Carried on the cached config rather than read per turn, so enforcing a cap costs
+            # the chat path no query it was not already making. The cost is that raising or
+            # clearing a cap takes effect within the cache TTL rather than instantly, which is
+            # true of every other chatbot setting the widget reads.
+            retrieval_call_cap=config.get("monthly_retrieval_call_cap"),
+            usage_cap_message=config.get("usage_cap_message") or DEFAULT_USAGE_CAP_MESSAGE,
+            # Same reasoning, and the same TTL caveat — with one difference: an inline
+            # calibration evicts this entry itself, so a chatbot cannot spend a whole TTL
+            # measuring the same floor on every message.
+            nuvrag_mem_similarity_override=config.get("nuvrag_mem_similarity_override"),
+            nuvrag_mem_similarity_calibrated=config.get("nuvrag_mem_similarity_calibrated"),
         ),
         name=config.get("name") or "Assistant",
         status=config.get("status") or str(ChatbotStatus.ACTIVE),

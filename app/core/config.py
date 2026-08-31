@@ -237,10 +237,11 @@ class NuvragMemSettings(BaseSettings):
     # person, not a corpus, and a large k here mostly buys weakly-related facts crowding the
     # prompt next to the documents that actually answer the question.
     retrieval_top_k: int = Field(default=5, ge=1, le=50)
-    # Higher than document retrieval's 0.25 floor, because the cost of a wrong hit is worse:
-    # an irrelevant passage is ignorable, whereas an irrelevant "fact about you" is the model
-    # confidently telling a visitor something untrue about themselves.
-    retrieval_min_similarity: float = Field(default=0.45, ge=0.0, le=1.0)
+    # There is deliberately no `retrieval_min_similarity` here any more. It was one number for
+    # a whole deployment, and a cosine floor is a property of an embedding model rather than
+    # of the task — while every chatbot on the platform picks its own embedding provider and
+    # model. See `app/services/nuvrag_mem/calibration.py`: the floor is measured per chatbot,
+    # against the model it actually uses, and lives in two columns on `chatbot`.
 
     # --- write path ---
     # How many recent turns the extractor is shown. Enough for a preference stated across two
@@ -265,6 +266,25 @@ class NuvragMemSettings(BaseSettings):
     purge_max_batches_per_chatbot: int = Field(default=40, ge=1)
     lock_key: str = "maintenance:purge-nuvrag-mem"
     lock_ttl_seconds: int = Field(default=3600, ge=60)
+
+
+class UsageCapSettings(BaseSettings):
+    """What happens when the counters cannot be read, and nothing else.
+
+    *How much* a chatbot may spend is per chatbot — `monthly_ingestion_unit_cap` and
+    `monthly_retrieval_call_cap` — for the same reason retention's duration is: the budget
+    belongs to whoever runs the providers for that bot. What is here is the one judgement an
+    operator might reasonably want to make differently.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="USAGE_CAP_", env_file=".env", extra="ignore")
+
+    # Fail open, matching the rate limiter. If Postgres cannot be reached the cap status is
+    # unknown, and a transient blip silencing every widget on the platform is worse than a
+    # bounded amount of uncounted spend during it — bounded because the outage that hid the
+    # counters is also stopping most of the work. An operator who would rather stop spending
+    # than keep answering flips this, and both enforcement points honour it identically.
+    fail_closed: bool = False
 
 
 class RateLimitSettings(BaseSettings):
@@ -323,6 +343,7 @@ class Settings(BaseSettings):
     retrieval: RetrievalSettings = Field(default_factory=RetrievalSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
     nuvrag_mem: NuvragMemSettings = Field(default_factory=NuvragMemSettings)
+    usage_cap: UsageCapSettings = Field(default_factory=UsageCapSettings)
     rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
 

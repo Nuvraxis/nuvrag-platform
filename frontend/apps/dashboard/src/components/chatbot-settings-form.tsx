@@ -1,6 +1,6 @@
 'use client'
 
-import type { Chatbot } from '@rag/api-client'
+import type { Chatbot, MemoryCalibration } from '@rag/api-client'
 import {
   Alert,
   AlertDescription,
@@ -28,7 +28,13 @@ const STATUS_HINT: Record<string, string> = {
     'The widget stops appearing, and the chatbot is out of the way day to day. Documents, conversations and settings are all kept.',
 }
 
-export function ChatbotSettingsForm({ chatbot }: { chatbot: Chatbot }) {
+export function ChatbotSettingsForm({
+  chatbot,
+  calibration,
+}: {
+  chatbot: Chatbot
+  calibration: MemoryCalibration
+}) {
   const { form, state, formProps } = useActionForm({
     action: updateChatbotAction,
     schema: chatbotSchema,
@@ -53,7 +59,11 @@ export function ChatbotSettingsForm({ chatbot }: { chatbot: Chatbot }) {
               </Alert>
             ) : null}
 
-            <ChatbotFields control={form.control} />
+            <ChatbotFields
+              control={form.control}
+              usage={chatbot.usage}
+              calibration={calibration}
+            />
 
             <FormField
               control={form.control}

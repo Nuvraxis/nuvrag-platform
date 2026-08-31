@@ -12,7 +12,7 @@ from app.core.crypto import decrypt_credentials, encrypt_credentials
 from app.core.exceptions import ConflictError, DomainError, NotFoundError
 from app.core.logging import get_logger
 from app.db.session import tenant_session
-from app.models import ChatbotAIConfig
+from app.models import Chatbot, ChatbotAIConfig
 from app.repositories import (
     ChatbotAIConfigRepository,
     ChatbotRepository,
@@ -35,8 +35,16 @@ from app.services.ai.registry import (
     is_ready,
     missing_credential_fields,
 )
+from app.services.cache import ChatbotConfigCache
+from app.services.nuvrag_mem import calibration
+from app.services.redis_client import get_redis
 
 logger = get_logger(__name__)
+
+
+def _chatbot_cache() -> ChatbotConfigCache:
+    return ChatbotConfigCache(get_redis(), settings.redis.chatbot_cache_ttl_seconds)
+
 
 # Long enough to prove the round trip, short enough that nobody is billed for testing.
 _TEST_PROMPT = [HumanMessage(content="Reply with the single word: ok")]
@@ -56,12 +64,14 @@ async def get_config(org_id: UUID, chatbot_id: UUID) -> AIConfigRead:
 
 async def save_config(org_id: UUID, chatbot_id: UUID, payload: AIConfigUpdate) -> AIConfigRead:
     async with tenant_session(org_id) as session:
-        await _require_chatbot(session, org_id, chatbot_id)
+        chatbot = await _require_chatbot(session, org_id, chatbot_id)
         repo = ChatbotAIConfigRepository(session)
         existing = await repo.get_for_chatbot(chatbot_id)
         locked = await _has_chunks(session, chatbot_id)
+        # Computed before `_apply` mutates the row out from under the comparison.
+        embedding_moved = existing is not None and _embedding_changed(existing, payload.embedding)
 
-        if existing is not None and locked and _embedding_changed(existing, payload.embedding):
+        if embedding_moved and locked:
             raise ConflictError(
                 f"This chatbot already has documents embedded with "
                 f"{existing.embedding_provider}/{existing.embedding_model}. Delete them before "
@@ -81,7 +91,18 @@ async def save_config(org_id: UUID, chatbot_id: UUID, payload: AIConfigUpdate) -
         _apply(config, payload)
         await repo.add(config)
 
+        if embedding_moved:
+            # nuvrag_mem's similarity floor was measured against the model being left behind,
+            # and a cosine floor does not carry across models — that is the whole reason it is
+            # measured per chatbot. Clearing it here, in the transaction that moves the model,
+            # is what stops a failed save leaving a threshold describing a model nobody uses.
+            # The next recall attempt measures a new one.
+            calibration.clear(session, chatbot)
+            public_key = chatbot.public_key
+
     await factory.invalidate(chatbot_id)
+    if embedding_moved:
+        await _chatbot_cache().invalidate(public_key)
     if config.embedding_dimension is None:
         await _discover_dimension(org_id, chatbot_id, config)
     return _read(config, locked=locked)
@@ -375,9 +396,11 @@ def _read(config: ChatbotAIConfig, *, locked: bool) -> AIConfigRead:
     )
 
 
-async def _require_chatbot(session: Any, org_id: UUID, chatbot_id: UUID) -> None:
-    if await ChatbotRepository(session).get_for_org(chatbot_id, org_id) is None:
+async def _require_chatbot(session: Any, org_id: UUID, chatbot_id: UUID) -> Chatbot:
+    chatbot = await ChatbotRepository(session).get_for_org(chatbot_id, org_id)
+    if chatbot is None:
         raise NotFoundError(f"Chatbot {chatbot_id} not found")
+    return chatbot
 
 
 async def _has_chunks(session: Any, chatbot_id: UUID) -> bool:

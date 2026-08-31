@@ -369,6 +369,34 @@
           "model_config_json": {
             "$ref": "#/components/schemas/GenerationConfig"
           },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.",
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Retrieval rounds allowed per UTC calendar month \u2014 one per answered chat turn. Null is unlimited, which is the default.",
+            "title": "Monthly Retrieval Call Cap"
+          },
           "name": {
             "maxLength": 200,
             "minLength": 1,
@@ -389,6 +417,20 @@
             "default": 30,
             "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
             "title": "Nuvrag Mem Retention Days"
+          },
+          "nuvrag_mem_similarity_override": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting \u2014 a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.",
+            "title": "Nuvrag Mem Similarity Override"
           },
           "privacy_url": {
             "default": "",
@@ -426,6 +468,12 @@
           },
           "theme_json": {
             "$ref": "#/components/schemas/WidgetTheme"
+          },
+          "usage_cap_message": {
+            "default": "Sorry \u2014 I can't answer questions right now. Please try again later, or ask for a human if you need help sooner.",
+            "maxLength": 1000,
+            "title": "Usage Cap Message",
+            "type": "string"
           }
         },
         "required": [
@@ -485,6 +533,28 @@
             "title": "Model Config Json",
             "type": "object"
           },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Retrieval Call Cap"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -499,6 +569,40 @@
               }
             ],
             "title": "Nuvrag Mem Retention Days"
+          },
+          "nuvrag_mem_similarity_calibrated": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nuvrag Mem Similarity Calibrated"
+          },
+          "nuvrag_mem_similarity_calibrated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nuvrag Mem Similarity Calibrated At"
+          },
+          "nuvrag_mem_similarity_override": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nuvrag Mem Similarity Override"
           },
           "org_id": {
             "format": "uuid",
@@ -548,6 +652,20 @@
             "format": "date-time",
             "title": "Updated At",
             "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UsagePeriodRead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "usage_cap_message": {
+            "title": "Usage Cap Message",
+            "type": "string"
           }
         },
         "required": [
@@ -562,6 +680,12 @@
           "theme_json",
           "retention_days",
           "nuvrag_mem_retention_days",
+          "nuvrag_mem_similarity_override",
+          "nuvrag_mem_similarity_calibrated",
+          "nuvrag_mem_similarity_calibrated_at",
+          "monthly_ingestion_unit_cap",
+          "monthly_retrieval_call_cap",
+          "usage_cap_message",
           "privacy_url",
           "terms_url",
           "public_key",
@@ -640,6 +764,34 @@
               }
             ]
           },
+          "monthly_ingestion_unit_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.",
+            "title": "Monthly Ingestion Unit Cap"
+          },
+          "monthly_retrieval_call_cap": {
+            "anyOf": [
+              {
+                "maximum": 1000000000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Retrieval rounds allowed per UTC calendar month \u2014 one per answered chat turn. Null is unlimited, which is the default.",
+            "title": "Monthly Retrieval Call Cap"
+          },
           "name": {
             "anyOf": [
               {
@@ -666,6 +818,20 @@
             ],
             "description": "Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.",
             "title": "Nuvrag Mem Retention Days"
+          },
+          "nuvrag_mem_similarity_override": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting \u2014 a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.",
+            "title": "Nuvrag Mem Similarity Override"
           },
           "privacy_url": {
             "anyOf": [
@@ -736,6 +902,18 @@
                 "type": "null"
               }
             ]
+          },
+          "usage_cap_message": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usage Cap Message"
           }
         },
         "title": "ChatbotUpdate",
@@ -1336,6 +1514,74 @@
           }
         },
         "title": "MemberUpdate",
+        "type": "object"
+      },
+      "MemoryCalibrationRead": {
+        "description": "The similarity floor in force for one chatbot, and where it came from.\n\n`effective_threshold` is derived rather than stored \u2014 an override wins over a\nmeasurement \u2014 and is reported here so a caller does not have to re-implement that\nprecedence to know what the gate is actually doing. Null means no floor is known, which\nis not a floor of zero: until one is measured, nothing is recalled at all.",
+        "properties": {
+          "calibrated": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calibrated"
+          },
+          "calibrated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calibrated At"
+          },
+          "effective_threshold": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effective Threshold"
+          },
+          "override": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Override"
+          },
+          "source": {
+            "enum": [
+              "override",
+              "calibrated",
+              "uncalibrated"
+            ],
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "effective_threshold",
+          "source",
+          "override",
+          "calibrated",
+          "calibrated_at"
+        ],
+        "title": "MemoryCalibrationRead",
         "type": "object"
       },
       "MemoryNoteRead": {
@@ -2288,6 +2534,31 @@
         "title": "TokenPair",
         "type": "object"
       },
+      "UsagePeriodRead": {
+        "description": "This month's running totals. Absent until the month's first charge.",
+        "properties": {
+          "ingestion_units_used": {
+            "title": "Ingestion Units Used",
+            "type": "integer"
+          },
+          "period_start": {
+            "format": "date",
+            "title": "Period Start",
+            "type": "string"
+          },
+          "retrieval_calls_used": {
+            "title": "Retrieval Calls Used",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "period_start",
+          "ingestion_units_used",
+          "retrieval_calls_used"
+        ],
+        "title": "UsagePeriodRead",
+        "type": "object"
+      },
       "UserRead": {
         "properties": {
           "created_at": {
@@ -3149,6 +3420,7 @@
         ]
       },
       "get": {
+        "description": "The detail view, which is the only place `usage` is populated \u2014 the list endpoint\nwould need one lookup per row to do the same.",
         "operationId": "get_chatbot_api_v1_chatbots__chatbot_id__get",
         "parameters": [
           {
@@ -3771,7 +4043,7 @@
         ]
       },
       "post": {
-        "description": "Accepted immediately; parsing and embedding happen on the ingestion worker.",
+        "description": "Accepted immediately; parsing and embedding happen on the ingestion worker.\n\nAnswers 429 when the chatbot has spent its monthly ingestion allowance, with the current\ntotal and the ceiling in `details` so the dashboard can say which it is.",
         "operationId": "upload_document_api_v1_chatbots__chatbot_id__documents_post",
         "parameters": [
           {
@@ -4057,6 +4329,104 @@
           }
         ],
         "summary": "Embed Snippet",
+        "tags": [
+          "chatbots"
+        ]
+      }
+    },
+    "/api/v1/chatbots/{chatbot_id}/memory-calibration": {
+      "get": {
+        "description": "The similarity floor in force for this chatbot, and where it came from.",
+        "operationId": "memory_calibration_api_v1_chatbots__chatbot_id__memory_calibration_get",
+        "parameters": [
+          {
+            "description": "Chatbot identifier",
+            "in": "path",
+            "name": "chatbot_id",
+            "required": true,
+            "schema": {
+              "description": "Chatbot identifier",
+              "format": "uuid",
+              "title": "Chatbot Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryCalibrationRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Memory Calibration",
+        "tags": [
+          "chatbots"
+        ]
+      },
+      "post": {
+        "description": "Measure the floor now instead of waiting for the next returning visitor.\n\nCalls the chatbot's embedding provider once, which is what makes this a POST. It is the\nsame measurement the chat path takes lazily, and neither is charged against the usage\ncaps: this is the platform sizing its own gate, not tenant-facing traffic.",
+        "operationId": "recalibrate_memory_api_v1_chatbots__chatbot_id__memory_calibration_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "chatbot_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Chatbot Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemoryCalibrationRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Recalibrate Memory",
         "tags": [
           "chatbots"
         ]

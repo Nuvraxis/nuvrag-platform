@@ -1,11 +1,13 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import ConfigDict
-from sqlalchemy import CheckConstraint, Column, Index, Text, UniqueConstraint
+from sqlalchemy import CheckConstraint, Column, Index, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
 from app.models.base import (
+    UTC_TIMESTAMP,
     OrgScopedMixin,
     TimestampMixin,
     UUIDPrimaryKeyMixin,
@@ -56,6 +58,66 @@ NUVRAG_MEM_RETENTION_CHECK = (
 # the column is not somewhere to put a document.
 LINK_MAX_LENGTH = 500
 
+# Usage caps. NULL means unlimited, which is what every chatbot starts at — this is a ceiling
+# an operator opts into, not a tier anyone is sold.
+#
+# The lower bound is 1 rather than 0 for the same reason retention's is: a zero would read as
+# "allow nothing", which is what `status = paused` already says properly. The upper bound is
+# well under int4's range so that `used + amount <= cap` cannot overflow the column it is
+# compared against.
+USAGE_CAP_MIN = 1
+USAGE_CAP_MAX = 1_000_000_000
+
+USAGE_CAP_CHECKS = {
+    "monthly_ingestion_unit_cap": (
+        f"monthly_ingestion_unit_cap IS NULL OR "
+        f"monthly_ingestion_unit_cap BETWEEN {USAGE_CAP_MIN} AND {USAGE_CAP_MAX}"
+    ),
+    "monthly_retrieval_call_cap": (
+        f"monthly_retrieval_call_cap IS NULL OR "
+        f"monthly_retrieval_call_cap BETWEEN {USAGE_CAP_MIN} AND {USAGE_CAP_MAX}"
+    ),
+}
+
+# Bounds for both nuvrag_mem similarity columns. A cosine similarity between two embeddings
+# of the same model is in [-1, 1] in general, but every provider here returns normalised
+# vectors and the recall comparison only ever runs on non-negative territory — a floor at or
+# below zero would admit everything, which is what "no gate at all" already means.
+SIMILARITY_MIN = 0.0
+SIMILARITY_MAX = 1.0
+
+NUVRAG_MEM_SIMILARITY_CHECKS = {
+    "nuvrag_mem_similarity_override": (
+        f"nuvrag_mem_similarity_override IS NULL OR "
+        f"nuvrag_mem_similarity_override BETWEEN {SIMILARITY_MIN} AND {SIMILARITY_MAX}"
+    ),
+    "nuvrag_mem_similarity_calibrated": (
+        f"nuvrag_mem_similarity_calibrated IS NULL OR "
+        f"nuvrag_mem_similarity_calibrated BETWEEN {SIMILARITY_MIN} AND {SIMILARITY_MAX}"
+    ),
+}
+
+# What a visitor is told when the chatbot has spent its month. Deliberately says nothing about
+# quotas or billing: that is the operator's business, and a visitor can only act on the part
+# that concerns them.
+USAGE_CAP_MESSAGE_MAX_LENGTH = 1000
+DEFAULT_USAGE_CAP_MESSAGE = (
+    "Sorry — I can't answer questions right now. Please try again later, or ask for a human "
+    "if you need help sooner."
+)
+
+
+def _sql_literal(value: str) -> str:
+    """A SQL string literal for a `server_default`.
+
+    Alembic's `compare_server_default` renders the metadata's default straight into a
+    comparison query, so a plain Python string containing an apostrophe produces a syntax
+    error rather than a diff. Handing it an already-quoted literal is what makes the default
+    comparable at all.
+    """
+    escaped = value.replace("'", "''")
+    return f"'{escaped}'"
+
 
 class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, table=True):
     __tablename__ = "chatbot"
@@ -66,6 +128,11 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
         # The naming convention expands `name` into `ck_chatbot_retention_days`.
         CheckConstraint(RETENTION_CHECK, name="retention_days"),
         CheckConstraint(NUVRAG_MEM_RETENTION_CHECK, name="nuvrag_mem_retention_days"),
+        *(CheckConstraint(sql, name=column) for column, sql in USAGE_CAP_CHECKS.items()),
+        *(
+            CheckConstraint(sql, name=column)
+            for column, sql in NUVRAG_MEM_SIMILARITY_CHECKS.items()
+        ),
     )
 
     # `model_config_json` collides with Pydantic's reserved `model_` namespace.
@@ -111,6 +178,39 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
     # The 30 a new chatbot starts at lives in `ChatbotCreate` instead, which sends it as a
     # value like any other. See `NUVRAG_MEM_RETENTION_DEFAULT_DAYS`.
     nuvrag_mem_retention_days: int | None = Field(default=None, nullable=True)
+
+    # The cosine floor a recalled note has to clear, in two columns because they answer two
+    # different questions. `override` is what an operator decided and is never recalculated;
+    # `calibrated` is what this chatbot's own embedding model measured, and NULL means "not
+    # measured for the configuration currently saved". There is deliberately no third column
+    # holding an effective value: it is `override ?? calibrated`, and storing a derived thing
+    # is how the two get to disagree.
+    #
+    # NULL on `calibrated` is meaningful in the same way the columns above it are — it is the
+    # signal that makes the next recall attempt calibrate — so, as ever since 0013, neither
+    # column carries a default of any kind.
+    nuvrag_mem_similarity_override: float | None = Field(default=None, nullable=True)
+    nuvrag_mem_similarity_calibrated: float | None = Field(default=None, nullable=True)
+    # Display only. What an operator needs in order to read a threshold is when it was
+    # measured, because a calibration made before an embedding model changed describes a
+    # model this chatbot no longer uses.
+    nuvrag_mem_similarity_calibrated_at: datetime | None = Field(
+        default=None, sa_type=UTC_TIMESTAMP, nullable=True
+    )
+
+    # No default of any kind on either cap, for the reason migration 0013 spells out: NULL is
+    # meaningful here — it means unlimited — and SQLAlchemy treats a None at insert time as
+    # "nothing to say" and lets any default overwrite it.
+    monthly_ingestion_unit_cap: int | None = Field(default=None, nullable=True)
+    monthly_retrieval_call_cap: int | None = Field(default=None, nullable=True)
+
+    usage_cap_message: str = Field(
+        default=DEFAULT_USAGE_CAP_MESSAGE,
+        max_length=USAGE_CAP_MESSAGE_MAX_LENGTH,
+        sa_type=Text,
+        nullable=False,
+        sa_column_kwargs={"server_default": text(_sql_literal(DEFAULT_USAGE_CAP_MESSAGE))},
+    )
 
     # Shown in the widget footer, above the branding. Deliberately *not* in `theme_json`:
     # "Reset to the default theme" empties that column outright, and quietly deleting a

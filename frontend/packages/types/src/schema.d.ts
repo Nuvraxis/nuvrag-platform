@@ -158,7 +158,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get Chatbot */
+        /**
+         * Get Chatbot
+         * @description The detail view, which is the only place `usage` is populated — the list endpoint
+         *     would need one lookup per row to do the same.
+         */
         get: operations["get_chatbot_api_v1_chatbots__chatbot_id__get"];
         put?: never;
         post?: never;
@@ -311,6 +315,9 @@ export interface paths {
         /**
          * Upload a document for ingestion
          * @description Accepted immediately; parsing and embedding happen on the ingestion worker.
+         *
+         *     Answers 429 when the chatbot has spent its monthly ingestion allowance, with the current
+         *     total and the ceiling in `details` so the dashboard can say which it is.
          */
         post: operations["upload_document_api_v1_chatbots__chatbot_id__documents_post"];
         delete?: never;
@@ -365,6 +372,34 @@ export interface paths {
         get: operations["embed_snippet_api_v1_chatbots__chatbot_id__embed_snippet_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/chatbots/{chatbot_id}/memory-calibration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Memory Calibration
+         * @description The similarity floor in force for this chatbot, and where it came from.
+         */
+        get: operations["memory_calibration_api_v1_chatbots__chatbot_id__memory_calibration_get"];
+        put?: never;
+        /**
+         * Recalibrate Memory
+         * @description Measure the floor now instead of waiting for the next returning visitor.
+         *
+         *     Calls the chatbot's embedding provider once, which is what makes this a POST. It is the
+         *     same measurement the chat path takes lazily, and neither is charged against the usage
+         *     caps: this is the platform sizing its own gate, not tenant-facing traffic.
+         */
+        post: operations["recalibrate_memory_api_v1_chatbots__chatbot_id__memory_calibration_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -789,6 +824,16 @@ export interface components {
             /** Description */
             description?: string | null;
             model_config_json?: components["schemas"]["GenerationConfig"];
+            /**
+             * Monthly Ingestion Unit Cap
+             * @description Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.
+             */
+            monthly_ingestion_unit_cap?: number | null;
+            /**
+             * Monthly Retrieval Call Cap
+             * @description Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null is unlimited, which is the default.
+             */
+            monthly_retrieval_call_cap?: number | null;
             /** Name */
             name: string;
             /**
@@ -797,6 +842,11 @@ export interface components {
              * @default 30
              */
             nuvrag_mem_retention_days: number | null;
+            /**
+             * Nuvrag Mem Similarity Override
+             * @description Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting — a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.
+             */
+            nuvrag_mem_similarity_override?: number | null;
             /**
              * Privacy Url
              * @description Absolute URL of the tenant's privacy policy, shown in the widget footer. Empty string for no link.
@@ -820,6 +870,11 @@ export interface components {
              */
             terms_url: string;
             theme_json?: components["schemas"]["WidgetTheme"];
+            /**
+             * Usage Cap Message
+             * @default Sorry — I can't answer questions right now. Please try again later, or ask for a human if you need help sooner.
+             */
+            usage_cap_message: string;
         };
         /** ChatbotCreateResponse */
         ChatbotCreateResponse: {
@@ -846,10 +901,20 @@ export interface components {
             model_config_json: {
                 [key: string]: unknown;
             };
+            /** Monthly Ingestion Unit Cap */
+            monthly_ingestion_unit_cap: number | null;
+            /** Monthly Retrieval Call Cap */
+            monthly_retrieval_call_cap: number | null;
             /** Name */
             name: string;
             /** Nuvrag Mem Retention Days */
             nuvrag_mem_retention_days: number | null;
+            /** Nuvrag Mem Similarity Calibrated */
+            nuvrag_mem_similarity_calibrated: number | null;
+            /** Nuvrag Mem Similarity Calibrated At */
+            nuvrag_mem_similarity_calibrated_at: string | null;
+            /** Nuvrag Mem Similarity Override */
+            nuvrag_mem_similarity_override: number | null;
             /**
              * Org Id
              * Format: uuid
@@ -877,6 +942,9 @@ export interface components {
              * Format: date-time
              */
             updated_at: string;
+            usage?: components["schemas"]["UsagePeriodRead"] | null;
+            /** Usage Cap Message */
+            usage_cap_message: string;
         };
         /**
          * ChatbotSecret
@@ -903,6 +971,16 @@ export interface components {
             /** Description */
             description?: string | null;
             model_config_json?: components["schemas"]["GenerationConfig"] | null;
+            /**
+             * Monthly Ingestion Unit Cap
+             * @description Ingestion units allowed per UTC calendar month, where one unit is 4000 bytes of uploaded document, rounded up. Null is unlimited, which is the default.
+             */
+            monthly_ingestion_unit_cap?: number | null;
+            /**
+             * Monthly Retrieval Call Cap
+             * @description Retrieval rounds allowed per UTC calendar month — one per answered chat turn. Null is unlimited, which is the default.
+             */
+            monthly_retrieval_call_cap?: number | null;
             /** Name */
             name?: string | null;
             /**
@@ -910,6 +988,11 @@ export interface components {
              * @description Days of remembered visitor detail to keep, counted from when an entry was last used to answer a question. Null keeps it indefinitely. Unlike conversation retention this defaults to 30 days rather than to null, because a memory is a standing summary of a person rather than a record of one conversation. Memory for a visitor with an unresolved ticket is never purged.
              */
             nuvrag_mem_retention_days?: number | null;
+            /**
+             * Nuvrag Mem Similarity Override
+             * @description Cosine similarity a remembered note must reach against the visitor's question before it is recalled. Null means use the value calibrated against this chatbot's own embedding model, which is the default and the recommended setting — a floor that is right for one embedding model is generally wrong for another. Set it only to override that measurement.
+             */
+            nuvrag_mem_similarity_override?: number | null;
             /** Privacy Url */
             privacy_url?: string | null;
             /**
@@ -923,6 +1006,8 @@ export interface components {
             /** Terms Url */
             terms_url?: string | null;
             theme_json?: components["schemas"]["WidgetTheme"] | null;
+            /** Usage Cap Message */
+            usage_cap_message?: string | null;
         };
         /** ComponentHealth */
         ComponentHealth: {
@@ -1222,6 +1307,30 @@ export interface components {
             /** Is Active */
             is_active?: boolean | null;
             role?: components["schemas"]["UserRole"] | null;
+        };
+        /**
+         * MemoryCalibrationRead
+         * @description The similarity floor in force for one chatbot, and where it came from.
+         *
+         *     `effective_threshold` is derived rather than stored — an override wins over a
+         *     measurement — and is reported here so a caller does not have to re-implement that
+         *     precedence to know what the gate is actually doing. Null means no floor is known, which
+         *     is not a floor of zero: until one is measured, nothing is recalled at all.
+         */
+        MemoryCalibrationRead: {
+            /** Calibrated */
+            calibrated: number | null;
+            /** Calibrated At */
+            calibrated_at: string | null;
+            /** Effective Threshold */
+            effective_threshold: number | null;
+            /** Override */
+            override: number | null;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "override" | "calibrated" | "uncalibrated";
         };
         /**
          * MemoryNoteRead
@@ -1633,6 +1742,21 @@ export interface components {
              * @default bearer
              */
             token_type: string;
+        };
+        /**
+         * UsagePeriodRead
+         * @description This month's running totals. Absent until the month's first charge.
+         */
+        UsagePeriodRead: {
+            /** Ingestion Units Used */
+            ingestion_units_used: number;
+            /**
+             * Period Start
+             * Format: date
+             */
+            period_start: string;
+            /** Retrieval Calls Used */
+            retrieval_calls_used: number;
         };
         /** UserRead */
         UserRead: {
@@ -2616,6 +2740,69 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["EmbedSnippet"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    memory_calibration_api_v1_chatbots__chatbot_id__memory_calibration_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Chatbot identifier */
+                chatbot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryCalibrationRead"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recalibrate_memory_api_v1_chatbots__chatbot_id__memory_calibration_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                chatbot_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MemoryCalibrationRead"];
                 };
             };
             /** @description Validation Error */
