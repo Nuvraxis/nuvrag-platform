@@ -280,6 +280,10 @@ than internal service names.
 | `INGESTION_CLAMAV_HOST` / `_PORT` | unset / `3310` | unset disables scanning; see [Malware scanning](#malware-scanning) |
 | `RETRIEVAL_TOP_K` | `5` | per-chatbot settings override this |
 | `RETRIEVAL_MIN_SIMILARITY` | `0.25` | below this a chunk is not retrieved at all, which is what produces the "no grounded answer" path |
+| `RETRIEVAL_HYBRID_CANDIDATES` | `20` | how many candidates each half of [hybrid search](#finding-the-right-passage) contributes before fusion |
+| `RETRIEVAL_LEXICAL_MIN_RANK` | `0.2` | the text-match floor. `ts_rank_cd` scores 0.1 per matched term, so this means "more than one isolated word" |
+| `RETRIEVAL_RERANK_MAX_CANDIDATES` | `20` | how many passages the rerank prompt is shown |
+| `RETRIEVAL_RERANK_EXCERPT_CHARACTERS` | `400` | how much of each passage it is shown |
 | `RETRIEVAL_HISTORY_WINDOW_MESSAGES` | `8` | prior turns sent with each question |
 | `RETRIEVAL_HNSW_EF_SEARCH` | `80` | recall against latency |
 | `RETENTION_ENABLED` | `true` | whether the purge is scheduled at all. *How long* anything is kept is per chatbot, in the database — see [Conversation retention](#conversation-retention) |
@@ -301,6 +305,7 @@ than internal service names.
 | `RATE_LIMIT_SESSION_CAPACITY` / `_REFILL_PER_SECOND` | `20` / `0.25` | per widget session — the session id is browser-generated, so this shapes traffic rather than stopping abuse |
 | `RATE_LIMIT_TICKET_IP_CAPACITY` / `_REFILL_PER_SECOND` | `3` / `0.0014` | ~5 tickets an hour from one address, per chatbot |
 | `RATE_LIMIT_TICKET_CHATBOT_CAPACITY` / `_REFILL_PER_SECOND` | `30` / `0.01` | ~36 tickets an hour per chatbot, whatever the addresses |
+| `RATE_LIMIT_SEARCH_CAPACITY` / `_REFILL_PER_SECOND` | `60` / `1.0` | `POST /api/v1/search`, per chatbot — its own bucket, so bulk search cannot throttle the widget |
 | `SECURITY_CLIENT_IP_HEADER` | `cf-connecting-ip` | which header carries the real client address; see [spam](#keeping-spam-out-of-the-ticket-queue) |
 | `OTEL_SERVICE_NAME` | `rag-api` | names the service in traces and in Postgres `application_name` |
 | `OTEL_LOG_LEVEL` | `INFO` | |
@@ -490,6 +495,87 @@ link rather than the chat.
 The **Powered by Nuvraxis** line links to `nuvraxis.com` with the chatbot's own header as
 `utm_source`, URL-encoded. Like every other link the widget renders it opens in a new tab with
 `rel="noopener noreferrer nofollow"`.
+
+## Finding the right passage
+
+Retrieval is meaning-based by default: the question is embedded and compared against the
+embedded passages of your documents. That is the right default and it has one blind spot.
+Embeddings are good at *what a sentence is about* and bad at *which exact token it contains* —
+`XR-7742B` and `XR-7743C` land in almost the same place, and a question naming one will
+cheerfully retrieve the other.
+
+**Hybrid search** adds a second, literal search over the same passages and combines the two
+rankings. Turn it on per chatbot, on the settings page or over the API:
+
+```bash
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json' -d '{"hybrid_search_enabled": true}'
+```
+
+It is **off for every existing chatbot** and stays off until you say otherwise, because it
+changes which passages an answer is built from. Turn it on when your documents are full of
+things a paraphrase cannot reach: part numbers, model codes, error codes, acronyms, surnames,
+file names.
+
+The two rankings are combined by **Reciprocal Rank Fusion** — each passage scores
+`1 / (60 + its position)` in each list it appears in, and the scores are added. Position
+rather than score, deliberately: a cosine similarity and a text-match rank are not on the same
+scale and there is no honest constant that converts one to the other. Fusion by position needs
+no such constant, and there is no lexical-versus-vector weight to tune because none exists.
+What it does prefer is agreement — a passage both halves quite like beats one that either half
+alone loves.
+
+**Reranking** is a second, separate switch. It asks the chatbot's own chat model to put the
+combined results in the best order before the answer is written:
+
+```bash
+curl -X PATCH "$API/api/v1/chatbots/$CHATBOT_ID" -H "Authorization: Bearer $TOKEN"   -H 'Content-Type: application/json'   -d '{"hybrid_search_enabled": true, "hybrid_rerank_enabled": true}'
+```
+
+It costs one extra model call per answered turn, does nothing unless hybrid search is on, and
+never breaks a turn: if the model's reply cannot be read as an ordering, the fused order is
+used and the visitor sees a normal answer.
+
+**What this changes about the "talk to a human" offer.** The widget offers a person when a
+turn found nothing relevant. With hybrid search on, "nothing relevant" now means nothing
+cleared the meaning-based floor **and** nothing cleared the text-match floor — an OR of two
+gates that each mean something on their own, rather than one number over the combined score.
+A passage found only by the literal search is a real answer, and offering a human alongside it
+would be wrong. Conversational turns are unaffected: "hi", "thanks" and "ok bye" match no
+document literally either, so they still count as finding nothing.
+
+### Searching without a conversation
+
+`POST /api/v1/search` runs the same retrieval and returns the passages, with no answer
+generated and nothing written to any transcript. It is authenticated by the chatbot's **secret
+key** rather than a dashboard login, so a backend can call it directly:
+
+```bash
+curl -X POST "$API/api/v1/search"   -H "X-Chatbot-Secret: $CHATBOT_SECRET_KEY"   -H 'Content-Type: application/json'   -d '{"query": "torque for the XR-7742B flange", "top_k": 5, "rerank": false}'
+```
+
+```json
+{"query": "torque for the XR-7742B flange",
+ "hits": [{"chunk_id": "...", "document_id": "...", "content": "The XR-7742B flange ...",
+           "metadata": {"page": 12}, "score": 0.0328,
+           "similarity": 0.41, "lexical_score": 0.4,
+           "vector_rank": 3, "lexical_rank": 1}],
+ "grounded": true, "reranked": false}
+```
+
+`similarity` is the meaning-based score and `lexical_score` the text-match one. Either can be
+`null`, and that is a statement rather than a gap: it means that half of the search did not
+return this passage at all, which is not the same as returning it with a score of zero.
+`grounded` is the same signal the widget turns into its offer of a human.
+
+This endpoint **always** uses hybrid search, whatever the chatbot's chat-path toggle says —
+that toggle exists to keep existing answers from changing, and this endpoint has no existing
+answers to preserve. Each call counts as one retrieval against
+[usage caps](#usage-caps), and it has its own rate-limit bucket so a backend querying it in
+bulk cannot throttle the widget answering live visitors on the same chatbot.
+
+The secret key is shown once, when the chatbot is created and whenever it is rotated. Rotating
+it takes effect immediately. Unlike the public widget key it is a real credential: it grants
+read access to everything that chatbot has indexed.
 
 ## Human takeover
 

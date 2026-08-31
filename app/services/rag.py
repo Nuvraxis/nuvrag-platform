@@ -1,6 +1,6 @@
 import time
 from collections.abc import AsyncIterator
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any
 from uuid import UUID
 
@@ -24,6 +24,7 @@ from app.services.ai import factory
 from app.services.ai.prompts import Citation, build_chat_messages, build_citations
 from app.services.nuvrag_mem.calibration import CalibrationState
 from app.services.nuvrag_mem.retrieval import recall
+from app.services.retrieval import hybrid_search, rerank
 from app.services.usage import UsageKind, consume
 
 logger = get_logger(__name__)
@@ -43,6 +44,10 @@ class ChatContext:
     # nothing has been measured yet, which is what makes the next recall calibrate.
     nuvrag_mem_similarity_override: float | None = None
     nuvrag_mem_similarity_calibrated: float | None = None
+    # Hybrid retrieval, off unless the operator turned it on. Carried on the cached widget
+    # config like every other per-chatbot setting the chat path reads.
+    hybrid_search_enabled: bool = False
+    hybrid_rerank_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +61,11 @@ class Recollection:
 
     matches: list[RetrievedChunk]
     memories: list[RetrievedMemory]
+    # Whether retrieval found anything worth calling an answer. Separate from `matches` being
+    # non-empty because hybrid search puts chunks in `matches` for fusion reasons that have
+    # not cleared any floor; on the pure-vector path the two are the same thing by
+    # construction, since nothing below the floor is ever returned.
+    grounded: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +111,11 @@ async def _ensure_conversation(
 
 
 async def retrieve(
-    context: ChatContext, question: str, *, external_session_id: str
+    context: ChatContext,
+    question: str,
+    *,
+    external_session_id: str,
+    chat: factory.ChatProvider | None = None,
 ) -> Recollection:
     """Embed the question once, then search both things it can match.
 
@@ -123,7 +137,7 @@ async def retrieve(
         # honest answer: the prompt already tells the model to say it does not know. Memory is
         # skipped for the same reason — the write path refuses to run without a locked width,
         # so there is nothing at any width to find.
-        return Recollection(matches=[], memories=[])
+        return Recollection(matches=[], memories=[], grounded=False)
 
     query_vector = (await embedder.embed_batch([question]))[0]
 
@@ -131,14 +145,39 @@ async def retrieve(
     # searches share the one session: one connection, one snapshot, one round trip's worth of
     # setup rather than two.
     async with tenant_session(context.org_id, readonly=True) as session:
-        matches = await DocumentChunkRepository(session).search(
-            chatbot_id=context.chatbot_id,
-            embedding=query_vector,
-            dimension=embedder.dimension,
-            top_k=top_k,
-            min_similarity=min_similarity,
-            ef_search=settings.retrieval.hnsw_ef_search,
-        )
+        if context.hybrid_search_enabled:
+            hybrid = await hybrid_search(
+                session,
+                chatbot_id=context.chatbot_id,
+                question=question,
+                embedding=query_vector,
+                dimension=embedder.dimension,
+                top_k=top_k,
+                ef_search=settings.retrieval.hnsw_ef_search,
+            )
+            if context.hybrid_rerank_enabled and chat is not None:
+                fused, reordered = await rerank(chat, question=question, fused=hybrid.fused)
+                hybrid = replace(
+                    hybrid,
+                    fused=fused,
+                    matches=[item.chunk_match for item in fused],
+                    reranked=reordered,
+                )
+            matches, grounded = hybrid.matches, hybrid.grounded
+        else:
+            # Byte-for-byte the call this function has always made, reached whenever the
+            # toggle is off — which is every chatbot until an operator changes it. The
+            # lexical half is not merely ignored here, it is never run.
+            matches = await DocumentChunkRepository(session).search(
+                chatbot_id=context.chatbot_id,
+                embedding=query_vector,
+                dimension=embedder.dimension,
+                top_k=top_k,
+                min_similarity=min_similarity,
+                ef_search=settings.retrieval.hnsw_ef_search,
+            )
+            grounded = bool(matches)
+
         memories = await recall(
             session,
             org_id=context.org_id,
@@ -154,7 +193,7 @@ async def retrieve(
             embedder=embedder,
         )
 
-    return Recollection(matches=matches, memories=memories)
+    return Recollection(matches=matches, memories=memories, grounded=grounded)
 
 
 async def _load_history(context: ChatContext, conversation_id: UUID) -> list[Message]:
@@ -325,7 +364,7 @@ async def stream_answer(
         context.org_id, context.chatbot_id, context.generation_config
     )
 
-    recalled = await retrieve(context, question, external_session_id=external_session_id)
+    recalled = await retrieve(context, question, external_session_id=external_session_id, chat=chat)
     # Documents only, deliberately. `sources` means "the material this answer came from", and
     # a remembered fact about the visitor is not a document — putting one here would show it
     # in the widget's citation list as though it were.
@@ -393,10 +432,12 @@ async def stream_answer(
             "conversation_id": str(conversation_id),
             "message_id": str(turn.message_id),
             "latency_ms": latency_ms,
-            # Zero retrieved chunks is the same condition the prompt turns into "I do not
-            # have information about that in the available documents", so it is already the
-            # honest signal that a human would do better. Surfaced as an additive field
-            # rather than by parsing the answer text or inventing an intent classifier.
-            "can_escalate": not recalled.matches,
+            # Nothing was found that cleared a floor — the same condition the prompt turns
+            # into "I do not have information about that in the available documents", so it
+            # is already the honest signal that a human would do better. Surfaced as an
+            # additive field rather than by parsing the answer text or inventing an intent
+            # classifier. With hybrid search off this is exactly `not recalled.matches`,
+            # which is what it has always been.
+            "can_escalate": not recalled.grounded,
         },
     }

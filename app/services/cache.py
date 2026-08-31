@@ -31,6 +31,8 @@ def _serialise(chatbot: Chatbot) -> str:
             "usage_cap_message": chatbot.usage_cap_message,
             "nuvrag_mem_similarity_override": chatbot.nuvrag_mem_similarity_override,
             "nuvrag_mem_similarity_calibrated": chatbot.nuvrag_mem_similarity_calibrated,
+            "hybrid_search_enabled": chatbot.hybrid_search_enabled,
+            "hybrid_rerank_enabled": chatbot.hybrid_rerank_enabled,
         }
     )
 

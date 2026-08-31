@@ -205,6 +205,8 @@ export const chatbotSchema = z.object({
   retention_days: retentionDays,
   nuvrag_mem_retention_days: memoryRetentionDays,
   nuvrag_mem_similarity_override: memorySimilarityOverride,
+  hybrid_search_enabled: z.boolean(),
+  hybrid_rerank_enabled: z.boolean(),
   monthly_ingestion_unit_cap: ingestionCap,
   monthly_retrieval_call_cap: retrievalCap,
   usage_cap_message: z.string().max(1000, 'Keep the message to 1000 characters or fewer.'),
