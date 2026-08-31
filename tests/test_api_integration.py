@@ -5448,10 +5448,6 @@ class TestRetrievalCap:
         assert done["message_id"], "a counter outage silenced the widget"
 
 
-@pytest.mark.skipif(
-    _OLLAMA is None,
-    reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
-)
 async def _calibration(client, token: str, chatbot_id: str) -> dict:
     response = await client.get(
         f"/api/v1/chatbots/{chatbot_id}/memory-calibration",
@@ -6080,6 +6076,10 @@ class TestMemoryCalibrationApi:
         assert response.status_code == 404, response.text
 
 
+@pytest.mark.skipif(
+    _OLLAMA is None,
+    reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
+)
 class TestVisitorMemoryAgainstOllama:
     """The write path with nothing stubbed out.
 
