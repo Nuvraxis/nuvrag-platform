@@ -65,6 +65,8 @@ export function chatbotDefaults(chatbot?: Chatbot): ChatbotValues {
       chatbot?.monthly_ingestion_unit_cap == null ? '' : String(chatbot.monthly_ingestion_unit_cap),
     monthly_retrieval_call_cap:
       chatbot?.monthly_retrieval_call_cap == null ? '' : String(chatbot.monthly_retrieval_call_cap),
+    hybrid_search_enabled: chatbot?.hybrid_search_enabled ?? false,
+    hybrid_rerank_enabled: chatbot?.hybrid_rerank_enabled ?? false,
     usage_cap_message: chatbot?.usage_cap_message ?? '',
     status: chatbot?.status,
   }
@@ -275,6 +277,60 @@ export function ChatbotFields({
                     : `Calibrated: ${calibration.calibrated.toFixed(3)}`
                 }
                 aria-invalid={invalid}
+              />
+            )}
+          </FormField>
+        </FieldGroup>
+      </FieldSet>
+
+      <FieldSet className="border-border rounded-xl border p-4">
+        <FieldLegend variant="label" className="px-1">
+          Retrieval
+        </FieldLegend>
+        <FieldGroup>
+          <p className="text-muted-foreground text-sm">
+            How this chatbot finds the passages it answers from. Both are off to begin with, so
+            an existing chatbot keeps answering exactly as it does today until you turn them on.
+          </p>
+
+          <FormField
+            control={control}
+            name="hybrid_search_enabled"
+            label="Also search the words, not just the meaning"
+            orientation="horizontal"
+            description="Runs a full-text search alongside the usual meaning-based one and combines the two rankings. Worth turning on when your documents are full of things a paraphrase cannot reach — part numbers, model codes, acronyms, surnames."
+          >
+                        {({ field }) => (
+              <input
+                type="checkbox"
+                id={field.name}
+                name={field.name}
+                ref={field.ref}
+                checked={Boolean(field.value)}
+                onBlur={field.onBlur}
+                onChange={(event) => field.onChange(event.target.checked)}
+                className="border-input accent-primary size-4 shrink-0 rounded-sm border"
+              />
+            )}
+          </FormField>
+
+          <FormField
+            control={control}
+            name="hybrid_rerank_enabled"
+            label="Let the model re-order the results"
+            orientation="horizontal"
+            description="Asks this chatbot's own chat model to put the combined results in the best order before answering. Costs one extra model call per answer, and does nothing unless the setting above is on."
+          >
+                        {({ field }) => (
+              <input
+                type="checkbox"
+                id={field.name}
+                name={field.name}
+                ref={field.ref}
+                checked={Boolean(field.value)}
+                onBlur={field.onBlur}
+                onChange={(event) => field.onChange(event.target.checked)}
+                className="border-input accent-primary size-4 shrink-0 rounded-sm border"
               />
             )}
           </FormField>

@@ -126,6 +126,22 @@ class RateLimiter:
             cost=cost,
         )
 
+    async def check_search(self, chatbot_id: str, *, cost: int = 1) -> RateLimitVerdict:
+        """`/api/v1/search`, keyed per chatbot because the secret key *is* the chatbot.
+
+        There is no second bucket keyed on the caller the way ticketing has one keyed on the
+        address, and there does not need to be: holding the secret key is already proof of
+        being the tenant, so every call on this bucket is spending the tenant's own allowance.
+        """
+        if not self._config.enabled:
+            return RateLimitVerdict(True, 0.0, 0)
+        return await self._consume(
+            f"ratelimit:search:chatbot:{chatbot_id}",
+            capacity=self._config.search_capacity,
+            refill_rate=self._config.search_refill_per_second,
+            cost=cost,
+        )
+
     async def check_ticket_chatbot(self, chatbot_id: str, *, cost: int = 1) -> RateLimitVerdict:
         """The backstop for a distributed attempt, where every request is a new address and
         the per-address bucket therefore never fills."""

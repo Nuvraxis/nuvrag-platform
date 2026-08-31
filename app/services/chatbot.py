@@ -4,9 +4,15 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
 from app.core.exceptions import NotFoundError, UpstreamServiceError
-from app.core.security import generate_public_key, generate_secret_key, hash_api_key
+from app.core.security import (
+    SECRET_KEY_PREFIX,
+    generate_public_key,
+    generate_secret_key,
+    hash_api_key,
+    verify_api_key,
+)
 from app.core.slug import randomised_slug, slugify, unique_slug
-from app.db.session import tenant_session
+from app.db.session import system_session, tenant_session
 from app.models import Chatbot, ChatbotStatus, ChatbotUsagePeriod
 from app.repositories import ChatbotRepository
 from app.schemas.chatbot import (
@@ -42,6 +48,8 @@ def _build(org_id: UUID, payload: ChatbotCreate, slug: str, secret_key: str) -> 
         retention_days=payload.retention_days,
         nuvrag_mem_retention_days=payload.nuvrag_mem_retention_days,
         nuvrag_mem_similarity_override=payload.nuvrag_mem_similarity_override,
+        hybrid_search_enabled=payload.hybrid_search_enabled,
+        hybrid_rerank_enabled=payload.hybrid_rerank_enabled,
         monthly_ingestion_unit_cap=payload.monthly_ingestion_unit_cap,
         monthly_retrieval_call_cap=payload.monthly_retrieval_call_cap,
         usage_cap_message=payload.usage_cap_message,
@@ -99,6 +107,24 @@ async def get_chatbot(org_id: UUID, chatbot_id: UUID) -> Chatbot:
         chatbot = await ChatbotRepository(session).get_for_org(chatbot_id, org_id)
     if chatbot is None:
         raise NotFoundError(f"Chatbot {chatbot_id} not found")
+    return chatbot
+
+
+async def authenticate_secret_key(presented: str) -> Chatbot | None:
+    """The chatbot a secret key belongs to, or None.
+
+    Deliberately returns None for every failure — malformed, unknown, or a hash collision
+    that fails the confirming compare — so the caller cannot accidentally distinguish them in
+    a response. The prefix check is a cheap filter, not a security control.
+    """
+    if not presented.startswith(f"{SECRET_KEY_PREFIX}_"):
+        return None
+
+    async with system_session() as session:
+        chatbot = await ChatbotRepository(session).get_by_secret_hash(hash_api_key(presented))
+
+    if chatbot is None or not verify_api_key(presented, chatbot.secret_key_hash):
+        return None
     return chatbot
 
 

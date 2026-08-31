@@ -35,6 +35,11 @@ helm install rag oci://registry-1.docker.io/nuvraxis/rag-platform --version 1.2.
   --namespace rag --create-namespace \
   --values my-values.yaml
 ```
+### Dev
+```bash 
+helm upgrade --install rag ./infra/helm/rag-platform --namespace rag  --values ./infra/helm/values-config.yaml --values ./infra/helm/values-config.yaml --values ./infra/helm/values-secrets.yaml
+
+```
 
 No pull secret is needed: those images are public. The chart pins `image.tag` to its own
 `appVersion`, so a release installs exactly the four images that were built alongside it and

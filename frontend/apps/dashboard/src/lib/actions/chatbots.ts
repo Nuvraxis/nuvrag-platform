@@ -8,6 +8,7 @@ import { type ActionState, failed, fromError, succeeded } from '@/lib/action-sta
 import { authenticatedApi } from '@/lib/api'
 import {
   chatbotStatus,
+  checked,
   generationConfig,
   number,
   nuvragMemRetentionDays,
@@ -53,6 +54,8 @@ export async function createChatbotAction(
       retention_days: retentionDays(formData),
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
       nuvrag_mem_similarity_override: similarityOverride(formData),
+      hybrid_search_enabled: checked(formData, 'hybrid_search_enabled'),
+      hybrid_rerank_enabled: checked(formData, 'hybrid_rerank_enabled'),
       monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),
       monthly_retrieval_call_cap: usageCap(formData, 'monthly_retrieval_call_cap'),
       usage_cap_message: text(formData, 'usage_cap_message'),
@@ -104,6 +107,8 @@ export async function updateChatbotAction(
       nuvrag_mem_retention_days: nuvragMemRetentionDays(formData),
       // And null here drops an override, putting the chatbot back on its measured floor.
       nuvrag_mem_similarity_override: similarityOverride(formData),
+      hybrid_search_enabled: checked(formData, 'hybrid_search_enabled'),
+      hybrid_rerank_enabled: checked(formData, 'hybrid_rerank_enabled'),
       // Null removes a cap rather than leaving it alone, the same exception the two
       // retention fields get.
       monthly_ingestion_unit_cap: usageCap(formData, 'monthly_ingestion_unit_cap'),

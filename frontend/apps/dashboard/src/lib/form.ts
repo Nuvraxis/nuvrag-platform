@@ -77,6 +77,14 @@ export function similarityOverride(formData: FormData): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+/**
+ * An unchecked checkbox submits nothing at all, so absence is the "off" that a present value
+ * cannot express — the same reading the AI form's `think` toggle takes.
+ */
+export function checked(formData: FormData, name: string): boolean {
+  return formData.get(name) !== null
+}
+
 export function generationConfig(formData: FormData): GenerationConfig {
   return {
     temperature: number(formData, 'temperature', 0.2),

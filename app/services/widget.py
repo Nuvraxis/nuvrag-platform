@@ -82,6 +82,8 @@ async def resolve_chatbot(public_key: str) -> dict:
         "usage_cap_message": chatbot.usage_cap_message,
         "nuvrag_mem_similarity_override": chatbot.nuvrag_mem_similarity_override,
         "nuvrag_mem_similarity_calibrated": chatbot.nuvrag_mem_similarity_calibrated,
+        "hybrid_search_enabled": chatbot.hybrid_search_enabled,
+        "hybrid_rerank_enabled": chatbot.hybrid_rerank_enabled,
     }
 
 
@@ -210,6 +212,8 @@ def build_session(config: dict, allowed_origin: str) -> WidgetSession:
             # measuring the same floor on every message.
             nuvrag_mem_similarity_override=config.get("nuvrag_mem_similarity_override"),
             nuvrag_mem_similarity_calibrated=config.get("nuvrag_mem_similarity_calibrated"),
+            hybrid_search_enabled=bool(config.get("hybrid_search_enabled")),
+            hybrid_rerank_enabled=bool(config.get("hybrid_rerank_enabled")),
         ),
         name=config.get("name") or "Assistant",
         status=config.get("status") or str(ChatbotStatus.ACTIVE),
