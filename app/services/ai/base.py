@@ -4,6 +4,7 @@ Two protocols, one adapter for each, and the machinery both need: a batching, re
 loop, and a filter that keeps a model's private reasoning out of the answer a visitor reads.
 """
 
+import inspect
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
@@ -53,6 +54,8 @@ class ChatProvider(Protocol):
 
     def stream(self, messages: list[BaseMessage]) -> AsyncIterator[str]: ...
 
+    async def aclose(self) -> None: ...
+
 
 @runtime_checkable
 class EmbeddingProvider(Protocol):
@@ -65,6 +68,8 @@ class EmbeddingProvider(Protocol):
     dimension: int | None
 
     async def embed_batch(self, texts: list[str], *, attempts: int = 4) -> list[list[float]]: ...
+
+    async def aclose(self) -> None: ...
 
 
 class ReasoningFilter:
@@ -125,6 +130,52 @@ def _partial_tag_suffix(text: str, tag: str) -> str:
     return ""
 
 
+# LangChain publishes no way to close a model, so the transports have to be reached for by
+# name. These are the shapes the four SDKs actually build — read off constructed objects
+# rather than guessed at — and a model holding none of them has nothing to release. Every
+# wrapper also builds a synchronous twin this platform never calls, which is why the sync
+# paths are here too: unused or not, it owns a connection pool.
+_TRANSPORTS: tuple[tuple[str, ...], ...] = (
+    ("_async_client",),  # anthropic.AsyncAnthropic; ollama.AsyncClient
+    ("_async_client", "_client"),  # the httpx client inside either of those
+    ("_client",),  # the sync twin
+    ("root_async_client",),  # openai / Azure OpenAI chat
+    ("root_client",),
+    ("async_client", "_client"),  # openai / Azure OpenAI embeddings
+    ("client",),  # botocore
+    ("bedrock_client",),  # botocore again: ChatBedrockConverse builds a second one
+)
+
+
+async def release_transports(model: object) -> None:
+    """Close whatever connection pools a LangChain model is holding.
+
+    Called once, when a cached client is evicted. Failing to close is logged and swallowed:
+    a client being thrown away is already on its way out, and raising here would turn tidying
+    up into a failed request.
+    """
+    seen: set[int] = set()
+    for path in _TRANSPORTS:
+        target: Any = model
+        for name in path:
+            target = getattr(target, name, None)
+            if target is None:
+                break
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+
+        closer = getattr(target, "aclose", None) or getattr(target, "close", None)
+        if closer is None:
+            continue
+        try:
+            outcome = closer()
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception as exc:  # noqa: BLE001 - a client being discarded cannot fail a call
+            logger.warning("ai.client_close_failed", target=type(target).__name__, error=str(exc))
+
+
 class LangChainChat:
     """Adapts any LangChain chat model to :class:`ChatProvider`."""
 
@@ -144,6 +195,9 @@ class LangChainChat:
 
         if trailing := reasoning.flush():
             yield trailing
+
+    async def aclose(self) -> None:
+        await release_transports(self._model)
 
 
 class LangChainEmbeddings:
@@ -196,6 +250,9 @@ class LangChainEmbeddings:
             with attempt:
                 return await self._model.aembed_documents(texts)
         raise UpstreamServiceError("Embedding request failed")  # unreachable: reraise=True
+
+    async def aclose(self) -> None:
+        await release_transports(self._model)
 
 
 def _batches(items: list[str], size: int) -> Iterator[list[str]]:

@@ -6251,3 +6251,65 @@ class TestVisitorMemoryAgainstOllama:
         ).json()
         assert stored["source"] == "calibrated"
         assert stored["effective_threshold"] == pytest.approx(floor)
+
+
+class TestProviderClientLifecycle:
+    """Who owns a provider client, and when it stops existing."""
+
+    async def test_two_turns_for_one_chatbot_share_a_client(self, client):
+        from app.services.ai import clients, factory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        await clients.close_all()
+        first = await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+        second = await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+
+        assert first is second
+        assert clients.size() == 1
+
+    async def test_saving_a_configuration_closes_the_client_built_from_the_old_one(self, client):
+        """The one that matters for security rather than for memory.
+
+        A rotated or revoked credential has to stop working when it is rotated, not an hour
+        later when the entry happens to expire — so the save path that already clears the
+        Redis summary clears the live clients too.
+        """
+        from app.services.ai import clients, factory
+
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+
+        await clients.close_all()
+        stale = await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+        transport = stale._model._async_client._client
+        assert transport.is_closed is False
+
+        await _configure_ai(client, token, chatbot["id"], chat_model="a-different-model")
+
+        assert transport.is_closed is True
+        fresh = await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(chatbot["id"]))
+        assert fresh is not stale
+
+    async def test_one_chatbot_changing_does_not_disturb_another(self, client):
+        from app.services.ai import clients, factory
+
+        token, org_id = await _signup(client)
+        mine = (await _create_chatbot(client, token))["chatbot"]
+        theirs = (await _create_chatbot(client, token, "Second"))["chatbot"]
+        # Different models, so the two do not share one client and the test is about
+        # invalidation rather than about the key.
+        await _configure_ai(client, token, mine["id"], chat_model="mine")
+        await _configure_ai(client, token, theirs["id"], chat_model="theirs")
+
+        await clients.close_all()
+        untouched = await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(theirs["id"]))
+        await factory.get_chat_provider(uuid.UUID(org_id), uuid.UUID(mine["id"]))
+
+        await _configure_ai(client, token, mine["id"], chat_model="mine-again")
+
+        assert untouched._model._async_client._client.is_closed is False
+        assert clients.size() == 1

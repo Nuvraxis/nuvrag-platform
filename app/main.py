@@ -13,6 +13,7 @@ from app.db.session import dispose_engines
 from app.observability.metrics import instrument_metrics
 from app.observability.middleware import RequestContextMiddleware
 from app.observability.tracing import configure_tracing, instrument_app
+from app.services.ai.clients import close_all as close_ai_clients
 from app.services.redis_client import close_redis
 from app.services.storage import close_object_storage
 
@@ -35,6 +36,7 @@ async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
     finally:
         # Connections are closed explicitly so a rolling deploy drains rather than drops.
         await dispose_engines()
+        await close_ai_clients()
         await close_redis()
         await close_object_storage()
         logger.info("api.shutdown")

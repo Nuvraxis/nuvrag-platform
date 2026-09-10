@@ -9,6 +9,9 @@ name: rag
 
 x-backend-env: &backend-env
   ENVIRONMENT: local
+  # Matches the Helm ConfigMap: glibc never hands a freed per-thread arena back to the OS, so
+  # leaving the arena count unbounded reads from outside the process as a memory leak.
+  MALLOC_ARENA_MAX: "2"
   DB_CONNECTION_STRING: postgresql+asyncpg://postgres:postgres@postgres:5432/rag_db
   REDIS_URL: redis://redis:6379/0
   STORAGE_BACKEND: s3

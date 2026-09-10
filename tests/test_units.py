@@ -1,4 +1,6 @@
+import asyncio
 import json
+import time
 from typing import ClassVar
 from uuid import uuid4
 
@@ -652,23 +654,25 @@ class TestEncryptionKeySetting:
 
 
 class TestProviderSelection:
-    def test_every_chat_provider_has_a_builder(self):
+    def test_every_chat_provider_resolves_to_a_builder(self):
         from app.models import ChatProviderName
-        from app.services.ai.factory import CHAT_BUILDERS
+        from app.services.ai.factory import CHAT_MODULES, chat_builder
 
-        assert set(CHAT_BUILDERS) == set(ChatProviderName)
+        assert set(CHAT_MODULES) == set(ChatProviderName)
+        assert all(callable(chat_builder(name)) for name in ChatProviderName)
 
-    def test_every_embedding_provider_has_a_builder(self):
+    def test_every_embedding_provider_resolves_to_a_builder(self):
         from app.models import EmbeddingProviderName
-        from app.services.ai.factory import EMBEDDING_BUILDERS
+        from app.services.ai.factory import EMBEDDING_MODULES, embedding_builder
 
-        assert set(EMBEDDING_BUILDERS) == set(EmbeddingProviderName)
+        assert set(EMBEDDING_MODULES) == set(EmbeddingProviderName)
+        assert all(callable(embedding_builder(name)) for name in EmbeddingProviderName)
 
     def test_anthropic_is_not_reachable_as_an_embedding_provider(self):
         from app.services.ai import anthropic
-        from app.services.ai.factory import EMBEDDING_BUILDERS
+        from app.services.ai.factory import EMBEDDING_MODULES
 
-        assert "anthropic" not in {str(name) for name in EMBEDDING_BUILDERS}
+        assert "anthropic" not in {str(name) for name in EMBEDDING_MODULES}
         assert not hasattr(anthropic, "build_embeddings")
 
     @pytest.mark.parametrize(
@@ -1112,3 +1116,428 @@ class TestMemoryExtractionRules:
 
         for forbidden in ("passwords", "API keys", "card numbers", "health"):
             assert forbidden in _EXTRACTION_RULES
+
+
+class _FakeClient:
+    """Stands in for a provider adapter: the cache only ever calls `aclose`."""
+
+    def __init__(self, label: str = "") -> None:
+        self.label = label
+        self.closed = 0
+
+    async def aclose(self) -> None:
+        self.closed += 1
+
+
+# Where each SDK keeps the connection pool this platform actually opens, stated here
+# independently of the production table so that removing a path from that table is a failure
+# rather than a silent no-op. Bedrock is botocore, which has no async client at all.
+ASYNC_TRANSPORT = {
+    "azure": ("root_async_client",),
+    "anthropic": ("_async_client",),
+    "ollama": ("_async_client", "_client"),
+    "bedrock": ("client",),
+}
+ASYNC_EMBEDDING_TRANSPORT = ASYNC_TRANSPORT | {"azure": ("async_client", "_client")}
+
+
+def _resolve(model: object, path) -> object | None:
+    target = model
+    for name in path:
+        target = getattr(target, name, None)
+        if target is None:
+            return None
+    return target
+
+
+def _reachable_transports(model: object, paths) -> list[object]:
+    found = []
+    for path in paths:
+        target = model
+        for name in path:
+            target = getattr(target, name, None)
+            if target is None:
+                break
+        if target is not None and (hasattr(target, "aclose") or hasattr(target, "close")):
+            found.append(target)
+    return found
+
+
+class TestProviderClientCache:
+    """One client per configuration, bounded, and closed on the way out."""
+
+    @pytest.fixture(autouse=True)
+    def _empty(self):
+        from app.services.ai import clients
+
+        clients._entries.clear()
+        yield
+        clients._entries.clear()
+
+    @pytest.mark.asyncio
+    async def test_the_same_configuration_is_built_once(self):
+        from app.services.ai import clients
+
+        built = []
+
+        def build():
+            built.append(_FakeClient())
+            return built[-1]
+
+        owner = uuid4()
+        key = clients.cache_key("chat", "ollama", "a-model", {}, {}, {})
+        first = await clients.acquire(key, owner=owner, build=build)
+        second = await clients.acquire(key, owner=owner, build=build)
+
+        assert first is second
+        assert len(built) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_different_configuration_is_a_different_client(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        one = await clients.acquire(
+            clients.cache_key("chat", "ollama", "a-model", {}, {}, {"temperature": 0.2}),
+            owner=owner,
+            build=_FakeClient,
+        )
+        # Same endpoint, same key, different generation settings. Sharing a client here would
+        # quietly serve one chatbot the other chatbot's temperature.
+        two = await clients.acquire(
+            clients.cache_key("chat", "ollama", "a-model", {}, {}, {"temperature": 0.9}),
+            owner=owner,
+            build=_FakeClient,
+        )
+        assert one is not two
+
+    def test_a_credential_never_appears_in_the_key(self):
+        from app.services.ai import clients
+
+        key = clients.cache_key("chat", "anthropic", "m", {}, {"api_key": "sk-super-secret"}, {})
+        assert "sk-super-secret" not in key
+        assert len(key) == 64
+        # ...and it still identifies the client: another key is another client.
+        assert key != clients.cache_key("chat", "anthropic", "m", {}, {"api_key": "sk-other"}, {})
+
+    def test_the_cap_and_the_ttl_are_small_enough_to_bite(self):
+        """The bound below is relative to `CAPACITY`, and would hold at a million.
+
+        So this is the half that says the constants were chosen rather than merely obeyed: a
+        cache that evicts at a hundred thousand entries is not a bounded cache, and a client
+        held for a week is not a client that gets rebuilt when a credential is rotated.
+        """
+        from app.services.ai import clients
+
+        assert clients.CAPACITY <= 1024
+        assert clients.TTL_SECONDS <= 24 * 3600
+
+    @pytest.mark.asyncio
+    async def test_it_is_bounded_and_evicts_the_oldest(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        made = []
+        for index in range(clients.CAPACITY + 1):
+            client = _FakeClient(label=str(index))
+            made.append(client)
+            await clients.acquire(
+                clients.cache_key("chat", "ollama", f"model-{index}", {}, {}, {}),
+                owner=owner,
+                build=lambda c=client: c,
+            )
+
+        assert clients.size() == clients.CAPACITY
+        # First in, first out — and closed on the way out rather than merely dropped.
+        assert made[0].closed == 1
+        assert all(client.closed == 0 for client in made[1:])
+
+    @pytest.mark.asyncio
+    async def test_using_a_client_saves_it_from_eviction(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        oldest = _FakeClient("oldest")
+        oldest_key = clients.cache_key("chat", "ollama", "oldest", {}, {}, {})
+        await clients.acquire(oldest_key, owner=owner, build=lambda: oldest)
+
+        second = _FakeClient("second")
+        await clients.acquire(
+            clients.cache_key("chat", "ollama", "second", {}, {}, {}),
+            owner=owner,
+            build=lambda: second,
+        )
+        # Using it again moves it to the back of the eviction queue.
+        await clients.acquire(oldest_key, owner=owner, build=lambda: _FakeClient("never"))
+
+        # One more than the cap holds, so exactly one entry has to go.
+        for index in range(clients.CAPACITY - 1):
+            await clients.acquire(
+                clients.cache_key("chat", "ollama", f"filler-{index}", {}, {}, {}),
+                owner=owner,
+                build=_FakeClient,
+            )
+
+        assert oldest.closed == 0
+        assert second.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_an_expired_client_is_closed_and_rebuilt(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        key = clients.cache_key("chat", "ollama", "a-model", {}, {}, {})
+        stale = _FakeClient("stale")
+        await clients.acquire(key, owner=owner, build=lambda: stale)
+
+        clients._entries[key].expires_at = time.monotonic() - 1
+        fresh = await clients.acquire(key, owner=owner, build=lambda: _FakeClient("fresh"))
+
+        assert stale.closed == 1
+        assert fresh is not stale
+
+    @pytest.mark.asyncio
+    async def test_two_first_callers_do_not_each_build_one(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        key = clients.cache_key("chat", "ollama", "a-model", {}, {}, {})
+        built = []
+
+        def build():
+            built.append(_FakeClient())
+            return built[-1]
+
+        async def caller():
+            # Every real caller awaits its configuration out of the database first, and that
+            # is where two of them get interleaved. What matters is that both are past that
+            # await before either reaches the cache.
+            await asyncio.sleep(0)
+            return await clients.acquire(key, owner=owner, build=build)
+
+        one, two = await asyncio.gather(caller(), caller())
+
+        assert one is two
+        assert len(built) == 1
+        assert clients.size() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_configuration_change_drops_that_chatbot_and_no_other(self):
+        from app.services.ai import clients
+
+        changed, untouched = uuid4(), uuid4()
+        mine, theirs = _FakeClient("mine"), _FakeClient("theirs")
+        await clients.acquire(
+            clients.cache_key("chat", "ollama", "mine", {}, {}, {}),
+            owner=changed,
+            build=lambda: mine,
+        )
+        await clients.acquire(
+            clients.cache_key("chat", "ollama", "theirs", {}, {}, {}),
+            owner=untouched,
+            build=lambda: theirs,
+        )
+
+        await clients.invalidate(changed)
+
+        assert mine.closed == 1
+        assert theirs.closed == 0
+        assert clients.size() == 1
+
+    @pytest.mark.asyncio
+    async def test_a_shared_client_is_dropped_when_either_owner_changes(self):
+        from app.services.ai import clients
+
+        # Two chatbots on one Ollama server share a client, so a change to either one has to
+        # evict it — keeping it would serve the changed chatbot its old configuration.
+        first, second = uuid4(), uuid4()
+        shared = _FakeClient("shared")
+        key = clients.cache_key("chat", "ollama", "a-model", {}, {}, {})
+        await clients.acquire(key, owner=first, build=lambda: shared)
+        await clients.acquire(key, owner=second, build=lambda: _FakeClient("never"))
+
+        await clients.invalidate(second)
+
+        assert shared.closed == 1
+        assert clients.size() == 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_closes_everything(self):
+        from app.services.ai import clients
+
+        owner = uuid4()
+        made = [_FakeClient(str(index)) for index in range(3)]
+        for index, client in enumerate(made):
+            await clients.acquire(
+                clients.cache_key("chat", "ollama", f"model-{index}", {}, {}, {}),
+                owner=owner,
+                build=lambda c=client: c,
+            )
+
+        await clients.close_all()
+
+        assert clients.size() == 0
+        assert all(client.closed == 1 for client in made)
+
+
+class TestClientRelease:
+    """Each provider's transport is reachable, and closing it really closes it."""
+
+    @pytest.mark.parametrize(
+        ("provider", "config", "credentials"),
+        [
+            ("azure", {"endpoint": "https://x.openai.azure.com"}, {"api_key": "k"}),
+            (
+                "bedrock",
+                {"region": "eu-central-1"},
+                {"access_key_id": "a", "secret_access_key": "s"},
+            ),
+            ("anthropic", {}, {"api_key": "k"}),
+            ("ollama", {"base_url": "http://localhost:11434"}, {}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_closing_a_chat_client_releases_a_transport(self, provider, config, credentials):
+        from app.services.ai.base import _TRANSPORTS
+        from app.services.ai.factory import build_chat_provider
+
+        built = build_chat_provider(
+            provider=provider, model="a-model", config=config, credentials=credentials
+        )
+        # The guard that matters. If an SDK moves its transport somewhere else, the release
+        # finds nothing, closes nothing, and the leak comes back without a word — so assert
+        # there was something to close in the first place, and specifically that the
+        # *asynchronous* pool is reachable. Every wrapper also builds a synchronous twin this
+        # platform never calls, and "some transport was found" is satisfied by that one.
+        expected = _resolve(built._model, ASYNC_TRANSPORT[provider])
+        assert expected is not None, "the SDK moved its async transport"
+        assert expected in _reachable_transports(built._model, _TRANSPORTS)
+        await built.aclose()
+
+    @pytest.mark.parametrize(
+        ("provider", "config", "credentials"),
+        [
+            ("azure", {"endpoint": "https://x.openai.azure.com"}, {"api_key": "k"}),
+            (
+                "bedrock",
+                {"region": "eu-central-1"},
+                {"access_key_id": "a", "secret_access_key": "s"},
+            ),
+            ("ollama", {"base_url": "http://localhost:11434"}, {}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_closing_an_embedding_client_releases_a_transport(
+        self, provider, config, credentials
+    ):
+        from app.services.ai.base import _TRANSPORTS
+        from app.services.ai.factory import build_embedding_provider
+
+        built = build_embedding_provider(
+            provider=provider, model="a-model", config=config, credentials=credentials
+        )
+        expected = _resolve(built._model, ASYNC_EMBEDDING_TRANSPORT[provider])
+        assert expected is not None, "the SDK moved its async transport"
+        assert expected in _reachable_transports(built._model, _TRANSPORTS)
+        await built.aclose()
+
+    @pytest.mark.asyncio
+    async def test_an_ollama_connection_pool_is_really_shut(self):
+        from app.services.ai.factory import build_chat_provider
+
+        built = build_chat_provider(
+            provider="ollama",
+            model="a-model",
+            config={"base_url": "http://localhost:11434"},
+            credentials={},
+        )
+        transport = built._model._async_client._client
+        assert transport.is_closed is False
+        await built.aclose()
+        assert transport.is_closed is True
+
+    @pytest.mark.asyncio
+    async def test_a_model_holding_nothing_is_not_an_error(self):
+        from app.services.ai.base import release_transports
+
+        await release_transports(object())
+
+
+class TestApiProcessImports:
+    """What the API pays for at startup, asserted in a process that only did that."""
+
+    # Ingestion parses documents; the API receives them and hands them to a queue. These are
+    # the libraries a chat request must never have loaded, checked in a fresh interpreter
+    # because this one has imported the whole world to run the suite.
+    FORBIDDEN: ClassVar[tuple[str, ...]] = (
+        "pypdf",
+        "docx",
+        "langchain_text_splitters",
+        "youtube_transcript_api",
+        # No iteration was meant to put a model in the API process. If one of these ever
+        # appears, that is the finding, not the megabytes.
+        "torch",
+        "transformers",
+        "sentence_transformers",
+    )
+
+    @staticmethod
+    def _loaded_after_import() -> set[str]:
+        import subprocess
+        import sys
+
+        probe = (
+            "import sys, json; import app.main; "
+            "print(json.dumps(sorted({m.split('.')[0] for m in sys.modules})))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=180,
+        )
+        return set(json.loads(result.stdout.strip().splitlines()[-1]))
+
+    def test_ingestion_libraries_are_not_loaded_by_the_api(self):
+        loaded = self._loaded_after_import()
+        assert not loaded & set(self.FORBIDDEN)
+
+    def test_no_provider_sdk_is_loaded_until_one_is_used(self):
+        # The four together are over half of what the process resides in, and a chatbot uses
+        # at most two. Importing them is the factory's decision, made when it dispatches.
+        loaded = self._loaded_after_import()
+        assert not loaded & {"anthropic", "openai", "boto3", "botocore", "ollama"}
+
+
+class TestMetricCardinality:
+    """A Prometheus label whose values keep arriving is a slow-motion outage."""
+
+    # Every label this application is allowed to attach. `chatbot_id` is deliberate — the
+    # architecture calls per-chatbot cost the signal worth having — and it is the ceiling on
+    # this design: the series count grows with the number of chatbots, and only with that.
+    ALLOWED: ClassVar[frozenset[str]] = frozenset(
+        {"chatbot_id", "kind", "operation", "outcome", "method", "status", "handler"}
+    )
+
+    def test_no_metric_carries_a_label_that_is_not_on_the_list(self):
+        from app.observability import metrics
+
+        offenders = {}
+        for name in dir(metrics):
+            collector = getattr(metrics, name)
+            labels = getattr(collector, "_labelnames", None)
+            if not labels:
+                continue
+            if extra := set(labels) - self.ALLOWED:
+                offenders[getattr(collector, "_name", name)] = sorted(extra)
+
+        assert offenders == {}
+
+    def test_unmatched_paths_do_not_become_their_own_series(self):
+        from prometheus_fastapi_instrumentator import Instrumentator
+
+        # A request to a path no route matches would otherwise be labelled with the raw path,
+        # so anything scanning for /wp-admin would mint a series per URL it tried. The
+        # library groups those under one handler by default; this pins that it still does.
+        assert Instrumentator().should_group_untemplated is True
