@@ -80,6 +80,12 @@ The ConfigMap payload, defined once so the release's ConfigMap and the migration
 short-lived copy cannot drift apart.
 */}}
 {{- define "rag.configData" -}}
+{{- /* glibc gives every thread its own malloc arena and never returns a freed one to the
+operating system, so a process running asyncio alongside asyncpg and a threadpool grows
+resident memory that is free as far as Python is concerned and in use as far as the kubelet
+is concerned. Two is the usual floor for a server that is not compute-parallel. */}}
+MALLOC_ARENA_MAX: "2"
+
 ENVIRONMENT: {{ .Values.config.environment | quote }}
 DOCS_ENABLED: {{ .Values.config.docsEnabled | quote }}
 

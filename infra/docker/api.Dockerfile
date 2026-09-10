@@ -43,5 +43,11 @@ EXPOSE 8000
 
 # Migrations are never run here: they belong to a pre-deploy Job, so concurrent replicas
 # cannot race each other applying the same revision.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", \
+#
+# One worker process, not four. Each one imports the whole application — 200 MiB resident
+# before it answers anything — and four of them made a pod cost 800 MiB to sit idle. Nothing
+# on this path is CPU-bound: a chat turn is spent awaiting a provider, so a second process on
+# the same pod buys concurrency asyncio already had. Capacity comes from `replicaCount` and
+# the autoscaler, where the scheduler can see it, rather than from a number inside the image.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--forwarded-allow-ips", "*", "--no-server-header"]

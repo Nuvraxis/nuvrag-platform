@@ -89,11 +89,24 @@ api:
   podSecurityContext:
     runAsUser: 1001
     runAsGroup: 1001
+  # Measured, not guessed at — `python -m app.tools.measure_memory` drives 500 chat turns
+  # through the widget endpoint and samples the server process from outside:
+  #
+  #   135 MiB idle after startup, 148 MiB from turn 100, and flat to turn 500
+  #
+  # That is one pod serving one provider. A pod is one uvicorn process now (see the CMD in
+  # api.Dockerfile), and it imports a provider SDK the first time a tenant on that provider
+  # is served: the four together are 107 MiB, so a pod whose tenants span all of them settles
+  # nearer 220 MiB. The request covers that case rather than the measured one, because a pod
+  # does not get to choose which tenants land on it. The limit is twice the request.
   resources:
-    requests: { cpu: 250m, memory: 512Mi }
-    limits: { memory: 1Gi }
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { memory: 512Mi }
   # k3s ships metrics-server, so an HPA works without installing anything. It stays off by
   # default because a fixed pair of replicas is the right answer on a small cluster.
+  #
+  # CPU, not memory. Memory here is a baseline the process pays whatever it is doing, so
+  # scaling on it would add replicas that each cost the same baseline again.
   autoscaling:
     enabled: false
     minReplicas: 2
@@ -148,11 +161,13 @@ beat:
   podSecurityContext:
     runAsUser: 1001
     runAsGroup: 1001
-  # A scheduler that sleeps until the next crontab hit. It needs almost nothing; the sweep
-  # itself runs on the worker.
+  # A scheduler that sleeps until the next crontab hit, so it needs almost no CPU — the sweep
+  # itself runs on the worker. Memory is another matter: beat imports the task modules to
+  # build its schedule, which is the whole application, and it measured 143 MiB doing nothing
+  # at all. The old 128Mi request was below what the process costs to start.
   resources:
-    requests: { cpu: 50m, memory: 128Mi }
-    limits: { memory: 256Mi }
+    requests: { cpu: 50m, memory: 192Mi }
+    limits: { memory: 384Mi }
 
 dashboard:
   replicaCount: 1

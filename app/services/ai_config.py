@@ -125,7 +125,10 @@ async def _discover_dimension(org_id: UUID, chatbot_id: UUID, config: ChatbotAIC
             if config.embedding_credentials_encrypted
             else {},
         )
-        vectors = await _timed(provider.embed_batch(_TEST_EMBEDDING_INPUT, attempts=1))
+        try:
+            vectors = await _timed(provider.embed_batch(_TEST_EMBEDDING_INPUT, attempts=1))
+        finally:
+            await provider.aclose()
     except Exception as exc:  # noqa: BLE001 - a save must not fail on an optional measurement
         logger.info(
             "ai.dimension_deferred_to_ingestion",
@@ -269,7 +272,12 @@ async def _chat_probe(target: ChatTarget, credentials: dict[str, str]) -> None:
         credentials=credentials,
         generation_config=_TEST_GENERATION,
     )
-    spoken = "".join([delta async for delta in provider.stream(_TEST_PROMPT)])
+    # Closed here rather than cached: this client was built from credentials that are being
+    # tested, so it may well be one nothing will ever call again.
+    try:
+        spoken = "".join([delta async for delta in provider.stream(_TEST_PROMPT)])
+    finally:
+        await provider.aclose()
     if not spoken.strip():
         raise ValueError("the model produced no output")
 
@@ -281,7 +289,10 @@ async def _embedding_probe(target: EmbeddingTarget, credentials: dict[str, str])
         config=target.connection.model_dump(),
         credentials=credentials,
     )
-    vectors = await provider.embed_batch(_TEST_EMBEDDING_INPUT, attempts=1)
+    try:
+        vectors = await provider.embed_batch(_TEST_EMBEDDING_INPUT, attempts=1)
+    finally:
+        await provider.aclose()
     if not vectors or not vectors[0]:
         raise ValueError("empty embedding")
     return len(vectors[0])

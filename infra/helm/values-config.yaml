@@ -95,6 +95,13 @@ ingress:
 
 # Sizing. Autoscalers and disruption budgets stay off until the workload is spread across
 # more than one node: a PDB of minAvailable 1 against a single replica blocks kubectl drain.
+#
+# Requests and limits are deliberately not repeated here. They come from the chart defaults,
+# which carry the measurements they were derived from in a comment beside each number; a copy
+# in this file would be a second place to update and the first one to go stale. Override one
+# here only when this cluster genuinely differs, and say what about it differs.
+#
+# Each api pod is one uvicorn process. Capacity is replicas, so this is the number to raise.
 api:
   replicaCount: 1
 

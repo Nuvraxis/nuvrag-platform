@@ -960,6 +960,26 @@ image and sizing and is committed as the reviewable record; `values-secrets.yaml
 DSNs and keys and is gitignored, with a committed `.example.yaml` recording the key names.
 See the [chart README](infra/helm/rag-platform/README.md) for Funnel, storage and scaling.
 
+### Sizing
+
+An API pod is **one** uvicorn process. Capacity is `api.replicaCount` and the autoscaler, not
+a worker count inside the image: the process spends a chat turn awaiting a provider rather
+than computing, so a second process on the same pod buys concurrency asyncio already had —
+and costs another full copy of the interpreter and everything it imports. The requests in
+`values.yaml` come from `python -m app.tools.measure_memory`, which drives 500 chat turns
+through the widget endpoint and samples the server's resident memory from outside the
+process: 135 MiB idle, 148 MiB from turn 100, flat to turn 500. A pod imports a provider SDK
+the first time it serves a tenant using that provider, and the four together are 107 MiB, so
+the request covers a pod whose tenants span all of them rather than the measured single-
+provider case.
+
+Every backend container also gets `MALLOC_ARENA_MAX=2` from the ConfigMap. glibc hands each
+contending thread its own malloc arena and never returns a freed one to the operating system,
+which reads from outside as a leak. On this workload it was worth 0.4 MiB — the process is
+one event loop and a small threadpool, so it was never making many arenas — and it is set
+anyway because the default cap scales with the host's core count, and a node bigger than a
+laptop is where that stops being true.
+
 Three workflows, split by audience:
 
 | Workflow | Trigger | Does |
