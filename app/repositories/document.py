@@ -2,10 +2,11 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import cast, delete, text
+from sqlalchemy import cast, delete, func, text
 from sqlmodel import select
 
 from app.models import Document, DocumentChunk, DocumentStatus
+from app.models.document_chunk import TEXT_SEARCH_CONFIG
 from app.repositories.base import BaseRepository
 
 
@@ -13,6 +14,20 @@ from app.repositories.base import BaseRepository
 class RetrievedChunk:
     chunk: DocumentChunk
     similarity: float
+
+
+@dataclass(frozen=True, slots=True)
+class LexicalChunk:
+    """A chunk the text index matched, and how hard it matched.
+
+    A separate type from `RetrievedChunk` rather than a reused one with a differently-meaning
+    float. `similarity` is a cosine and `rank` is `ts_rank_cd`; they are not on the same scale,
+    not comparable, and the whole reason fusion happens by rank position is that nothing can
+    put them on one axis. Two names keeps that impossible to forget at a call site.
+    """
+
+    chunk: DocumentChunk
+    rank: float
 
 
 class DocumentRepository(BaseRepository[Document]):
@@ -107,3 +122,39 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
             if similarity >= min_similarity:
                 matches.append(RetrievedChunk(chunk=chunk, similarity=similarity))
         return matches
+
+    async def search_lexical(
+        self,
+        *,
+        chatbot_id: UUID,
+        tsquery: str,
+        dimension: int,
+        top_k: int,
+    ) -> list[LexicalChunk]:
+        """Full-text search over the same rows the vector search sees.
+
+        Filtered on `embedding_dim` even though a tsvector comparison would work across widths.
+        Two reasons, and only the second is about speed: fusion is only meaningful if both
+        halves drew from the same set of rows, and naming the width prunes to one partition
+        exactly as the vector side does.
+
+        No floor here. The rank is returned as measured and the caller decides what clears —
+        the fused ranking wants every candidate it can get, and the escalation gate wants the
+        floor. Those are different questions and this method answers neither.
+        """
+        if not tsquery:
+            return []
+
+        query = func.to_tsquery(TEXT_SEARCH_CONFIG, tsquery)
+        rank = func.ts_rank_cd(DocumentChunk.content_tsv, query).label("rank")
+        result = await self.session.execute(
+            select(DocumentChunk, rank)
+            .where(
+                DocumentChunk.chatbot_id == chatbot_id,
+                DocumentChunk.embedding_dim == dimension,
+                DocumentChunk.content_tsv.op("@@")(query),
+            )
+            .order_by(rank.desc())
+            .limit(top_k)
+        )
+        return [LexicalChunk(chunk=chunk, rank=float(value)) for chunk, value in result.all()]

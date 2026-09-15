@@ -120,6 +120,20 @@ def nuvrag_mem_similarity_field() -> Any:
     )
 
 
+HYBRID_SEARCH_DESCRIPTION = (
+    "Whether chat retrieval combines vector search with full-text search over the same "
+    "passages, fusing the two rankings. Off by default, so an existing chatbot's answers do "
+    "not change until an operator opts in. Helps most with exact terms an embedding blurs "
+    "together — part numbers, acronyms, rare proper nouns."
+)
+
+HYBRID_RERANK_DESCRIPTION = (
+    "Whether the fused results are then reordered by this chatbot's own chat model. Costs one "
+    "extra model call per answered turn and does nothing unless hybrid search is also on. If "
+    "the model's reply cannot be parsed, the fused order is used and the turn is unaffected."
+)
+
+
 def _validate_origins(value: list[str]) -> list[str]:
     """Origins are compared against the browser's `Origin` header, which is always
     scheme://host[:port] with no path or trailing slash."""
@@ -218,6 +232,8 @@ class ChatbotCreate(BaseModel):
     retention_days: int | None = retention_field()
     nuvrag_mem_retention_days: int | None = nuvrag_mem_retention_field()
     nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
+    hybrid_search_enabled: bool = Field(default=False, description=HYBRID_SEARCH_DESCRIPTION)
+    hybrid_rerank_enabled: bool = Field(default=False, description=HYBRID_RERANK_DESCRIPTION)
     monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
     monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
     usage_cap_message: str = Field(
@@ -257,6 +273,10 @@ class ChatbotUpdate(BaseModel):
     # And again: null here drops an override, putting the chatbot back on its calibrated
     # floor. There is no field for the calibrated value itself — it is measured, not set.
     nuvrag_mem_similarity_override: float | None = nuvrag_mem_similarity_field()
+    # Ordinary optional booleans: null is "unchanged", because there is no third state either
+    # of these could mean. Not reinstated after `exclude_none` for that reason.
+    hybrid_search_enabled: bool | None = Field(default=None, description=HYBRID_SEARCH_DESCRIPTION)
+    hybrid_rerank_enabled: bool | None = Field(default=None, description=HYBRID_RERANK_DESCRIPTION)
     # And again: null here removes a cap rather than leaving it alone.
     monthly_ingestion_unit_cap: int | None = usage_cap_field("monthly_ingestion_unit_cap")
     monthly_retrieval_call_cap: int | None = usage_cap_field("monthly_retrieval_call_cap")
@@ -325,6 +345,8 @@ class ChatbotRead(BaseModel):
     # calibration is on file for the embedding model currently configured.
     nuvrag_mem_similarity_calibrated: float | None
     nuvrag_mem_similarity_calibrated_at: datetime | None
+    hybrid_search_enabled: bool
+    hybrid_rerank_enabled: bool
     monthly_ingestion_unit_cap: int | None
     monthly_retrieval_call_cap: int | None
     usage_cap_message: str

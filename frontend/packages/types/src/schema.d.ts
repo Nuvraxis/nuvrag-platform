@@ -423,6 +423,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search a chatbot's indexed passages
+         * @description Retrieval without a conversation: no answer is generated and nothing is written.
+         *
+         *     Always hybrid — vector and lexical, fused — regardless of the chatbot's chat-path toggle.
+         *     That toggle exists to keep an existing chatbot's *answers* from changing underneath it,
+         *     and this endpoint has no existing answers to preserve.
+         *
+         *     Charged against the chatbot's monthly retrieval allowance, one per call, because it spends
+         *     the same embedding call a chat turn does.
+         */
+        post: operations["search_api_v1_search_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/team/invitations": {
         parameters: {
             query?: never;
@@ -823,6 +850,18 @@ export interface components {
             allowed_origins?: string[];
             /** Description */
             description?: string | null;
+            /**
+             * Hybrid Rerank Enabled
+             * @description Whether the fused results are then reordered by this chatbot's own chat model. Costs one extra model call per answered turn and does nothing unless hybrid search is also on. If the model's reply cannot be parsed, the fused order is used and the turn is unaffected.
+             * @default false
+             */
+            hybrid_rerank_enabled: boolean;
+            /**
+             * Hybrid Search Enabled
+             * @description Whether chat retrieval combines vector search with full-text search over the same passages, fusing the two rankings. Off by default, so an existing chatbot's answers do not change until an operator opts in. Helps most with exact terms an embedding blurs together — part numbers, acronyms, rare proper nouns.
+             * @default false
+             */
+            hybrid_search_enabled: boolean;
             model_config_json?: components["schemas"]["GenerationConfig"];
             /**
              * Monthly Ingestion Unit Cap
@@ -892,6 +931,10 @@ export interface components {
             created_at: string;
             /** Description */
             description: string | null;
+            /** Hybrid Rerank Enabled */
+            hybrid_rerank_enabled: boolean;
+            /** Hybrid Search Enabled */
+            hybrid_search_enabled: boolean;
             /**
              * Id
              * Format: uuid
@@ -970,6 +1013,16 @@ export interface components {
             allowed_origins?: string[] | null;
             /** Description */
             description?: string | null;
+            /**
+             * Hybrid Rerank Enabled
+             * @description Whether the fused results are then reordered by this chatbot's own chat model. Costs one extra model call per answered turn and does nothing unless hybrid search is also on. If the model's reply cannot be parsed, the fused order is used and the turn is unaffected.
+             */
+            hybrid_rerank_enabled?: boolean | null;
+            /**
+             * Hybrid Search Enabled
+             * @description Whether chat retrieval combines vector search with full-text search over the same passages, fusing the two rankings. Off by default, so an existing chatbot's answers do not change until an operator opts in. Helps most with exact terms an embedding blurs together — part numbers, acronyms, rare proper nouns.
+             */
+            hybrid_search_enabled?: boolean | null;
             model_config_json?: components["schemas"]["GenerationConfig"] | null;
             /**
              * Monthly Ingestion Unit Cap
@@ -1549,6 +1602,71 @@ export interface components {
         RefreshRequest: {
             /** Refresh Token */
             refresh_token: string;
+        };
+        /**
+         * SearchHit
+         * @description One passage, with every score that put it where it is.
+         *
+         *     Three separate numbers rather than one, because they answer different questions and are
+         *     not interchangeable. `score` is the fused rank score and orders this list; `similarity` is
+         *     the cosine the vector half measured; `lexical_score` is what the text index scored. A null
+         *     on either half means that half did not return this passage at all, which is not the same
+         *     as returning it with a low score — a passage found only lexically has no cosine, rather
+         *     than a cosine of zero.
+         */
+        SearchHit: {
+            /**
+             * Chunk Id
+             * Format: uuid
+             */
+            chunk_id: string;
+            /** Content */
+            content: string;
+            /**
+             * Document Id
+             * Format: uuid
+             */
+            document_id: string;
+            /** Lexical Rank */
+            lexical_rank: number | null;
+            /** Lexical Score */
+            lexical_score: number | null;
+            /** Metadata */
+            metadata: {
+                [key: string]: unknown;
+            };
+            /** Score */
+            score: number;
+            /** Similarity */
+            similarity: number | null;
+            /** Vector Rank */
+            vector_rank: number | null;
+        };
+        /** SearchRequest */
+        SearchRequest: {
+            /** Query */
+            query: string;
+            /**
+             * Rerank
+             * @default false
+             */
+            rerank: boolean;
+            /**
+             * Top K
+             * @default 5
+             */
+            top_k: number;
+        };
+        /** SearchResponse */
+        SearchResponse: {
+            /** Grounded */
+            grounded: boolean;
+            /** Hits */
+            hits: components["schemas"]["SearchHit"][];
+            /** Query */
+            query: string;
+            /** Reranked */
+            reranked: boolean;
         };
         /**
          * SignupRequest
@@ -2834,6 +2952,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatbotSecret"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    search_api_v1_search_post: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Chatbot secret key (sk_...), for server-to-server calls */
+                "X-Chatbot-Secret": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResponse"];
                 };
             };
             /** @description Validation Error */

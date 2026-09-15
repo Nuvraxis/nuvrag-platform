@@ -20,6 +20,19 @@ class ChatbotRepository(BaseRepository[Chatbot]):
         result = await self.session.execute(select(Chatbot).where(Chatbot.public_key == public_key))
         return result.scalar_one_or_none()
 
+    async def get_by_secret_hash(self, secret_key_hash: str) -> Chatbot | None:
+        """Server-to-server entry point. Unscoped for the same reason as the public key.
+
+        Looked up *by the hash* rather than by scanning and comparing: the digest of a
+        high-entropy key is what the unique index in 0016 is on, so this is one index probe.
+        The caller still confirms the match with a constant-time compare — the index has
+        already proven equality, and repeating it costs nothing next to the round trip.
+        """
+        result = await self.session.execute(
+            select(Chatbot).where(Chatbot.secret_key_hash == secret_key_hash)
+        )
+        return result.scalar_one_or_none()
+
     async def with_retention(self) -> list[tuple[UUID, UUID, int]]:
         """`(org_id, chatbot_id, retention_days)` for every chatbot that has opted in.
 

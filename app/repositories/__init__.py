@@ -6,6 +6,7 @@ from app.repositories.conversation import ConversationRepository, MessageReposit
 from app.repositories.document import (
     DocumentChunkRepository,
     DocumentRepository,
+    LexicalChunk,
     RetrievedChunk,
 )
 from app.repositories.identity import (
@@ -27,6 +28,7 @@ __all__ = [
     "DocumentChunkRepository",
     "DocumentRepository",
     "InvitationRepository",
+    "LexicalChunk",
     "MemoryEntryRepository",
     "MessageRepository",
     "OrganizationRepository",

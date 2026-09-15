@@ -229,8 +229,26 @@ class Chatbot(UUIDPrimaryKeyMixin, OrgScopedMixin, TimestampMixin, SQLModel, tab
         sa_column_kwargs={"server_default": ""},
     )
 
+    # Hybrid retrieval, off for every chatbot until an operator turns it on — so an existing
+    # chatbot's answers do not change underneath it. NOT NULL with a server default rather than
+    # nullable: unlike the retention windows and the usage caps there is no third state here,
+    # and a NULL would just be a second spelling of "off". The server default is also what
+    # backfills the rows that already exist.
+    hybrid_search_enabled: bool = Field(
+        default=False, nullable=False, sa_column_kwargs={"server_default": text("false")}
+    )
+    # Only consulted when `hybrid_search_enabled` is on: reranking reorders what fusion
+    # produced, so on its own it has nothing to reorder.
+    hybrid_rerank_enabled: bool = Field(
+        default=False, nullable=False, sa_column_kwargs={"server_default": text("false")}
+    )
+
     public_key: str = Field(max_length=128, unique=True, index=True, nullable=False)
-    secret_key_hash: str = Field(max_length=128, nullable=False)
+    # Unique and indexed since migration 0016, which is when it started being *looked up*
+    # rather than only written: `/api/v1/search` authenticates by finding the row whose hash
+    # matches, and a sequential scan of every chatbot on the platform per request is not an
+    # auth path.
+    secret_key_hash: str = Field(max_length=128, unique=True, index=True, nullable=False)
     status: ChatbotStatus = Field(
         default=ChatbotStatus.ACTIVE,
         sa_type=enum_column(ChatbotStatus, name="status"),

@@ -188,6 +188,20 @@ class RetrievalSettings(BaseSettings):
     max_context_characters: int = 12_000
     hnsw_ef_search: int = 80
 
+    # --- hybrid search (per chatbot, off by default; see `chatbot.hybrid_search_enabled`) ---
+    # How many candidates each half contributes before fusion. Wider than `top_k` on purpose:
+    # fusion can only promote a chunk that one of the two lists actually returned, so a list
+    # truncated to the final answer size would make the second half unable to rescue anything.
+    hybrid_candidates: int = Field(default=20, ge=1, le=100)
+    # The floor a lexical hit must clear to count as "we found something" for the purpose of
+    # the escalation offer. See `LEXICAL_FLOOR_NOTE` in app/services/retrieval.py — this is a
+    # count of matched terms wearing a decimal point, not a tuned score.
+    lexical_min_rank: float = Field(default=0.2, ge=0.0)
+    # A ceiling on what the rerank prompt is shown. Reranking asks the chatbot's own chat model
+    # to order the candidates, and every candidate is passage text in the prompt.
+    rerank_max_candidates: int = Field(default=20, ge=2, le=50)
+    rerank_excerpt_characters: int = Field(default=400, ge=80, le=2000)
+
 
 class RetentionSettings(BaseSettings):
     """When the conversation sweep runs, and how hard it is allowed to push.
@@ -309,6 +323,13 @@ class RateLimitSettings(BaseSettings):
     # one tenant's queue. Roughly 36 an hour, which is a busy support desk.
     ticket_chatbot_capacity: int = 30
     ticket_chatbot_refill_per_second: float = 0.01
+
+    # `/api/v1/search` is server-to-server and holds a secret key, so the caller is a system
+    # rather than a browser: fewer, larger, more deliberate calls than the widget makes. Its
+    # own bucket rather than a share of the chat one, because a backend batch-querying search
+    # must not be able to throttle the widget answering live visitors on the same chatbot.
+    search_capacity: int = 60
+    search_refill_per_second: float = 1.0
 
 
 class ObservabilitySettings(BaseSettings):

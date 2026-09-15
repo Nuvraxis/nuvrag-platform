@@ -366,6 +366,18 @@
             ],
             "title": "Description"
           },
+          "hybrid_rerank_enabled": {
+            "default": false,
+            "description": "Whether the fused results are then reordered by this chatbot's own chat model. Costs one extra model call per answered turn and does nothing unless hybrid search is also on. If the model's reply cannot be parsed, the fused order is used and the turn is unaffected.",
+            "title": "Hybrid Rerank Enabled",
+            "type": "boolean"
+          },
+          "hybrid_search_enabled": {
+            "default": false,
+            "description": "Whether chat retrieval combines vector search with full-text search over the same passages, fusing the two rankings. Off by default, so an existing chatbot's answers do not change until an operator opts in. Helps most with exact terms an embedding blurs together \u2014 part numbers, acronyms, rare proper nouns.",
+            "title": "Hybrid Search Enabled",
+            "type": "boolean"
+          },
           "model_config_json": {
             "$ref": "#/components/schemas/GenerationConfig"
           },
@@ -522,6 +534,14 @@
               }
             ],
             "title": "Description"
+          },
+          "hybrid_rerank_enabled": {
+            "title": "Hybrid Rerank Enabled",
+            "type": "boolean"
+          },
+          "hybrid_search_enabled": {
+            "title": "Hybrid Search Enabled",
+            "type": "boolean"
           },
           "id": {
             "format": "uuid",
@@ -683,6 +703,8 @@
           "nuvrag_mem_similarity_override",
           "nuvrag_mem_similarity_calibrated",
           "nuvrag_mem_similarity_calibrated_at",
+          "hybrid_search_enabled",
+          "hybrid_rerank_enabled",
           "monthly_ingestion_unit_cap",
           "monthly_retrieval_call_cap",
           "usage_cap_message",
@@ -753,6 +775,30 @@
               }
             ],
             "title": "Description"
+          },
+          "hybrid_rerank_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the fused results are then reordered by this chatbot's own chat model. Costs one extra model call per answered turn and does nothing unless hybrid search is also on. If the model's reply cannot be parsed, the fused order is used and the turn is unaffected.",
+            "title": "Hybrid Rerank Enabled"
+          },
+          "hybrid_search_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether chat retrieval combines vector search with full-text search over the same passages, fusing the two rankings. Off by default, so an existing chatbot's answers do not change until an operator opts in. Helps most with exact terms an embedding blurs together \u2014 part numbers, acronyms, rare proper nouns.",
+            "title": "Hybrid Search Enabled"
           },
           "model_config_json": {
             "anyOf": [
@@ -2090,6 +2136,149 @@
           "refresh_token"
         ],
         "title": "RefreshRequest",
+        "type": "object"
+      },
+      "SearchHit": {
+        "description": "One passage, with every score that put it where it is.\n\nThree separate numbers rather than one, because they answer different questions and are\nnot interchangeable. `score` is the fused rank score and orders this list; `similarity` is\nthe cosine the vector half measured; `lexical_score` is what the text index scored. A null\non either half means that half did not return this passage at all, which is not the same\nas returning it with a low score \u2014 a passage found only lexically has no cosine, rather\nthan a cosine of zero.",
+        "properties": {
+          "chunk_id": {
+            "format": "uuid",
+            "title": "Chunk Id",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "document_id": {
+            "format": "uuid",
+            "title": "Document Id",
+            "type": "string"
+          },
+          "lexical_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lexical Rank"
+          },
+          "lexical_score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lexical Score"
+          },
+          "metadata": {
+            "additionalProperties": true,
+            "title": "Metadata",
+            "type": "object"
+          },
+          "score": {
+            "title": "Score",
+            "type": "number"
+          },
+          "similarity": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Similarity"
+          },
+          "vector_rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vector Rank"
+          }
+        },
+        "required": [
+          "chunk_id",
+          "document_id",
+          "content",
+          "metadata",
+          "score",
+          "similarity",
+          "lexical_score",
+          "vector_rank",
+          "lexical_rank"
+        ],
+        "title": "SearchHit",
+        "type": "object"
+      },
+      "SearchRequest": {
+        "properties": {
+          "query": {
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Query",
+            "type": "string"
+          },
+          "rerank": {
+            "default": false,
+            "title": "Rerank",
+            "type": "boolean"
+          },
+          "top_k": {
+            "default": 5,
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "SearchRequest",
+        "type": "object"
+      },
+      "SearchResponse": {
+        "properties": {
+          "grounded": {
+            "title": "Grounded",
+            "type": "boolean"
+          },
+          "hits": {
+            "items": {
+              "$ref": "#/components/schemas/SearchHit"
+            },
+            "title": "Hits",
+            "type": "array"
+          },
+          "query": {
+            "title": "Query",
+            "type": "string"
+          },
+          "reranked": {
+            "title": "Reranked",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "query",
+          "hits",
+          "grounded",
+          "reranked"
+        ],
+        "title": "SearchResponse",
         "type": "object"
       },
       "SignupRequest": {
@@ -4477,6 +4666,61 @@
         "summary": "Rotate Secret",
         "tags": [
           "chatbots"
+        ]
+      }
+    },
+    "/api/v1/search": {
+      "post": {
+        "description": "Retrieval without a conversation: no answer is generated and nothing is written.\n\nAlways hybrid \u2014 vector and lexical, fused \u2014 regardless of the chatbot's chat-path toggle.\nThat toggle exists to keep an existing chatbot's *answers* from changing underneath it,\nand this endpoint has no existing answers to preserve.\n\nCharged against the chatbot's monthly retrieval allowance, one per call, because it spends\nthe same embedding call a chat turn does.",
+        "operationId": "search_api_v1_search_post",
+        "parameters": [
+          {
+            "description": "Chatbot secret key (sk_...), for server-to-server calls",
+            "in": "header",
+            "name": "X-Chatbot-Secret",
+            "required": true,
+            "schema": {
+              "description": "Chatbot secret key (sk_...), for server-to-server calls",
+              "title": "X-Chatbot-Secret",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SearchResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search a chatbot's indexed passages",
+        "tags": [
+          "search"
         ]
       }
     },

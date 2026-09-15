@@ -8,6 +8,7 @@ from app.api.v1 import (
     conversations,
     documents,
     health,
+    search,
     team,
     tickets,
 )
@@ -20,6 +21,9 @@ api_router.include_router(ai_config.router)
 api_router.include_router(documents.router)
 api_router.include_router(conversations.router)
 api_router.include_router(tickets.router)
+# Authenticated by a chatbot secret key rather than a dashboard token, so it is the one
+# route under this prefix that no logged-in user reaches and no browser calls.
+api_router.include_router(search.router)
 
 # Widget traffic is unauthenticated in the dashboard sense and is expected to be the
 # highest-volume surface, so it lives under its own prefix and can be routed or scaled

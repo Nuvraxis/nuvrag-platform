@@ -6076,6 +6076,909 @@ class TestMemoryCalibrationApi:
         assert response.status_code == 404, response.text
 
 
+def _flat_vector(seed: float, width: int = 768) -> list[float]:
+    """A vector deliberately almost identical for every passage.
+
+    Simulates an embedding model that cannot tell two similar passages apart — which is not a
+    contrived situation but the ordinary one for part numbers, model codes and surnames, where
+    the surrounding sentence dominates the vector and the distinguishing token barely moves it.
+    That is precisely the case lexical search exists to rescue.
+    """
+    values = [1.0] * width
+    values[0] += seed
+    length = math.sqrt(sum(v * v for v in values))
+    return [v / length for v in values]
+
+
+async def _seed_chunks(org_id: str, chatbot_id: str, passages: list[tuple[str, list[float]]]):
+    """Write chunks directly, with the embedding chosen by the test.
+
+    The ingestion pipeline is exercised everywhere else; what these tests need is control over
+    the vector, so that "the vector half cannot see the difference" is a fact of the fixture
+    rather than a hope about a stub.
+    """
+    from app.db.session import tenant_session
+    from app.models import DocumentChunk
+    from sqlalchemy import text as sql_text
+
+    document_id = uuid.uuid4()
+    async with tenant_session(uuid.UUID(org_id)) as session:
+        await session.execute(
+            sql_text(
+                "INSERT INTO document (id, org_id, chatbot_id, filename, file_type,"
+                " content_type, storage_path, checksum_sha256, status, size_bytes,"
+                " created_at, updated_at) VALUES (:d, :o, :c, 'handbook.md', 'md',"
+                " 'text/markdown', :k, :k, 'ready', 1, now(), now())"
+            ),
+            {
+                "d": document_id,
+                "o": uuid.UUID(org_id),
+                "c": uuid.UUID(chatbot_id),
+                "k": str(document_id),
+            },
+        )
+        for index, (body, vector) in enumerate(passages):
+            session.add(
+                DocumentChunk(
+                    org_id=uuid.UUID(org_id),
+                    document_id=document_id,
+                    chatbot_id=uuid.UUID(chatbot_id),
+                    chunk_index=index,
+                    content=body,
+                    embedding_dim=768,
+                    embedding=vector,
+                )
+            )
+    return document_id
+
+
+def _stub_embeddings(monkeypatch, width: int = 768) -> None:
+    """Point every provider lookup at the bag-of-words stub, locked to one width."""
+    from app.services.ai import factory
+
+    async def _provider(*_args, **_kwargs):
+        return _StubEmbeddings(width, locked=width)
+
+    monkeypatch.setattr(factory, "get_embedding_provider", _provider)
+
+
+# Two passages an embedding barely separates, and one that is plainly about something else.
+_PART_PASSAGES = [
+    ("The XR-7742B flange requires a torque of 40 Nm when fitted to the bracket.", 0.001),
+    ("The XR-7743C flange requires a torque of 55 Nm and uses a different gasket.", 0.002),
+    ("Returns are accepted within 30 days of delivery provided the item is unused.", 0.900),
+]
+
+
+class TestFusion:
+    """Reciprocal Rank Fusion, as arithmetic. No database and no provider."""
+
+    def _chunk(self, name: str):
+        from app.models import DocumentChunk
+
+        return DocumentChunk(
+            id=uuid.uuid5(uuid.NAMESPACE_OID, name),
+            org_id=uuid.uuid4(),
+            document_id=uuid.uuid4(),
+            chatbot_id=uuid.uuid4(),
+            chunk_index=0,
+            content=name,
+            embedding_dim=768,
+        )
+
+    def test_a_chunk_both_halves_found_outranks_either_halves_favourite(self):
+        """The bias RRF is chosen for. `b` is second on both lists and beats `a`, which one
+        list put first and the other never returned at all — agreement across two different
+        notions of relevance is better evidence than one strong opinion."""
+        from app.repositories import LexicalChunk, RetrievedChunk
+        from app.services.retrieval import fuse
+
+        a, b, c = (self._chunk(name) for name in "abc")
+        vector = [RetrievedChunk(chunk=a, similarity=0.9), RetrievedChunk(chunk=b, similarity=0.8)]
+        lexical = [LexicalChunk(chunk=c, rank=0.5), LexicalChunk(chunk=b, rank=0.4)]
+
+        order = [item.chunk_match.chunk.content for item in fuse(vector, lexical, limit=3)]
+        assert order[0] == "b"
+
+    def test_the_score_is_the_published_formula(self):
+        from app.repositories import LexicalChunk, RetrievedChunk
+        from app.services.retrieval import RRF_K, fuse
+
+        a, b = self._chunk("a"), self._chunk("b")
+        fused = fuse(
+            [RetrievedChunk(chunk=a, similarity=0.9)],
+            [LexicalChunk(chunk=a, rank=0.5), LexicalChunk(chunk=b, rank=0.4)],
+            limit=2,
+        )
+        by_name = {item.chunk_match.chunk.content: item for item in fused}
+
+        # `a` is first in both lists; `b` is second in one.
+        assert by_name["a"].score == pytest.approx(2 / (RRF_K + 1))
+        assert by_name["b"].score == pytest.approx(1 / (RRF_K + 2))
+        assert RRF_K == 60
+
+    def test_a_lexical_only_chunk_carries_no_cosine(self):
+        """`similarity` is 0.0 and `vector_rank` is None, and only the second of those is a
+        statement. A passage the vector search never ranked has no cosine — reporting one
+        would be inventing a measurement that was not taken."""
+        from app.repositories import LexicalChunk
+        from app.services.retrieval import fuse
+
+        only = self._chunk("lexical-only")
+        [item] = fuse([], [LexicalChunk(chunk=only, rank=0.4)], limit=5)
+
+        assert item.vector_rank is None
+        assert item.lexical_rank == 1
+        assert item.lexical_score == 0.4
+        assert item.similarity == 0.0
+
+    def test_a_tie_is_broken_by_id_not_by_which_half_answered_first(self):
+        """Two chunks each first in one list tie exactly on score. Left to insertion order the
+        winner would be whichever half happened to be read first, so the same corpus and the
+        same query could rank differently after an unrelated change to the query order. The id
+        is arbitrary but it is a property of the data rather than of the code path."""
+        from app.repositories import LexicalChunk, RetrievedChunk
+        from app.services.retrieval import fuse
+
+        # Sorted so the chunk given to the *lexical* half is the lower id, against the
+        # insertion order fusion would otherwise fall back on.
+        lower, higher = sorted(
+            (self._chunk("tie-one"), self._chunk("tie-two")), key=lambda chunk: str(chunk.id)
+        )
+
+        fused = fuse(
+            [RetrievedChunk(chunk=higher, similarity=0.5)],
+            [LexicalChunk(chunk=lower, rank=0.5)],
+            limit=2,
+        )
+        assert fused[0].score == fused[1].score, "the fixture no longer produces a tie"
+        assert [item.chunk_match.chunk.id for item in fused] == [lower.id, higher.id]
+
+
+class TestRerankParsing:
+    """What counts as a usable reply from the model, and what falls back."""
+
+    def test_a_permutation_is_accepted_however_it_is_punctuated(self):
+        from app.services.retrieval import parse_rerank_order
+
+        assert parse_rerank_order("3,1,2", count=3) == [2, 0, 1]
+        assert parse_rerank_order("[2, 3, 1]", count=3) == [1, 2, 0]
+        assert parse_rerank_order("The best is 2, then 1, then 3.", count=3) == [1, 0, 2]
+
+    def test_anything_that_is_not_a_permutation_is_refused(self):
+        """Strict where it matters. A reply that drops, repeats or invents a candidate is not
+        a partial ranking to salvage — acting on half of it would silently discard passages
+        the fused order had already earned."""
+        from app.services.retrieval import parse_rerank_order
+
+        assert parse_rerank_order("1,2", count=3) is None, "short reply accepted"
+        assert parse_rerank_order("1,1,2", count=3) is None, "repeat accepted"
+        assert parse_rerank_order("1,2,5", count=3) is None, "out-of-range accepted"
+        assert parse_rerank_order("", count=3) is None
+        assert parse_rerank_order("I cannot help with that.", count=3) is None
+
+
+class TestHybridRecall:
+    """The claim the iteration is for, against the database."""
+
+    async def _ready(self, client):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [(body, _flat_vector(seed)) for body, seed in _PART_PASSAGES],
+        )
+        return token, org_id, chatbot
+
+    async def test_hybrid_finds_the_rare_term_that_vector_search_ranks_last(self, client):
+        """The whole point, in one assertion. The question names a part number; the embedding
+        cannot separate the two passages that mention part numbers, so pure vector search puts
+        the right one last. Lexical search puts it first, and fusion agrees."""
+        from app.db.session import tenant_session
+        from app.repositories import DocumentChunkRepository
+        from app.services.retrieval import hybrid_search
+
+        _token, org_id, chatbot = await self._ready(client)
+        question = "what torque does the XR-7742B flange need"
+        query_vector = _flat_vector(0.5)
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            pure = await DocumentChunkRepository(session).search(
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                embedding=query_vector,
+                dimension=768,
+                top_k=3,
+                min_similarity=-1.0,
+            )
+            result = await hybrid_search(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                question=question,
+                embedding=query_vector,
+                dimension=768,
+                top_k=3,
+            )
+
+        assert "XR-7742B" not in pure[0].chunk.content, (
+            "the fixture no longer demonstrates anything: pure vector search already wins"
+        )
+        assert "XR-7742B" in result.matches[0].chunk.content, "fusion did not rescue the rare term"
+
+        top = result.fused[0]
+        assert top.lexical_rank == 1
+        assert top.vector_rank is not None and top.vector_rank > 1, (
+            "the vector half was supposed to rank this poorly"
+        )
+
+    async def test_small_talk_matches_nothing_lexically(self, client):
+        """What protects iteration 13's fix. The lexical gate can only suppress the escalation
+        offer when it actually matches something, and a conversational turn matches nothing —
+        every word of it is either an English stopword or absent from the documents."""
+        from app.db.session import tenant_session
+        from app.repositories import DocumentChunkRepository
+        from app.services.retrieval import build_tsquery
+
+        _token, org_id, chatbot = await self._ready(client)
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            repo = DocumentChunkRepository(session)
+            for chatter in ("hi there", "thanks, that is great", "ok bye", "tell me more"):
+                hits = await repo.search_lexical(
+                    chatbot_id=uuid.UUID(chatbot["id"]),
+                    tsquery=await build_tsquery(session, chatter),
+                    dimension=768,
+                    top_k=5,
+                )
+                assert hits == [], f"{chatter!r} matched {len(hits)} passages lexically"
+
+    async def test_a_lexical_hit_grounds_a_turn_the_vector_floor_would_have_missed(self, client):
+        """The OR gate, both halves of it. The query vector is deliberately far from every
+        passage, so nothing clears the cosine floor; the lexical half clears its own."""
+        from app.db.session import tenant_session
+        from app.services.retrieval import hybrid_search
+
+        _token, org_id, chatbot = await self._ready(client)
+        # Orthogonal to the seeded vectors, so every cosine is ~0 and far below the 0.25 floor.
+        away = [0.0] * 768
+        away[7] = 1.0
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            hit = await hybrid_search(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                question="what torque does the XR-7742B flange need",
+                embedding=away,
+                dimension=768,
+                top_k=3,
+            )
+            miss = await hybrid_search(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                question="do you have anything about kangaroos",
+                embedding=away,
+                dimension=768,
+                top_k=3,
+            )
+
+        assert all(m.similarity < 0.25 for m in hit.matches), "a cosine cleared the floor"
+        assert hit.grounded is True, "a strong lexical match did not ground the turn"
+        assert miss.grounded is False, "nothing matched, yet the turn was called grounded"
+
+    async def test_a_vector_hit_grounds_a_turn_the_lexical_half_would_have_missed(self, client):
+        """The other half of the OR, and the one the toggle-off test cannot reach: with hybrid
+        search off `_grounded` is never called at all, so a broken vector branch would only
+        show up here — on a chatbot that has opted in, answering a question phrased in words
+        the documents never use."""
+        from app.db.session import tenant_session
+        from app.repositories import DocumentChunkRepository
+        from app.services.retrieval import build_tsquery, hybrid_search
+
+        _token, org_id, chatbot = await self._ready(client)
+        # The seeded vectors are near-identical, so this is a close match to all of them.
+        close = _flat_vector(0.0015)
+        question = "kangaroo marsupial antipodean"
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            lexical = await DocumentChunkRepository(session).search_lexical(
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                tsquery=await build_tsquery(session, question),
+                dimension=768,
+                top_k=5,
+            )
+            result = await hybrid_search(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                question=question,
+                embedding=close,
+                dimension=768,
+                top_k=3,
+            )
+
+        assert lexical == [], "the fixture no longer isolates the vector half"
+        assert any(m.similarity >= 0.25 for m in result.matches)
+        assert result.grounded is True, "a strong vector match did not ground the turn"
+
+    async def test_one_shared_word_is_not_a_lexical_match(self, client):
+        """What the floor is for. `ts_rank_cd` scores 0.1 per matched term occurrence, so a
+        question that happens to share a single ordinary word with a passage scores 0.1 and
+        does not ground the turn; two matched occurrences do. Without that step, any question
+        containing any word from any document would suppress the escalation offer."""
+        from app.db.session import tenant_session
+        from app.repositories import DocumentChunkRepository
+        from app.services.retrieval import build_tsquery, hybrid_search
+
+        _token, org_id, chatbot = await self._ready(client)
+        away = [0.0] * 768
+        away[7] = 1.0
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            weak = await DocumentChunkRepository(session).search_lexical(
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                tsquery=await build_tsquery(session, "were the items delivered"),
+                dimension=768,
+                top_k=5,
+            )
+            result = await hybrid_search(
+                session,
+                chatbot_id=uuid.UUID(chatbot["id"]),
+                question="were the items delivered",
+                embedding=away,
+                dimension=768,
+                top_k=3,
+            )
+
+        assert weak, "the fixture no longer produces a weak match to reject"
+        assert max(hit.rank for hit in weak) < 0.2, "this is no longer a one-word match"
+        assert result.grounded is False, "one shared word was treated as an answer"
+
+    async def test_the_lexical_half_stays_inside_one_chatbot(self, client):
+        """Same predicate as the vector half. A distinctive term in one tenant's corpus is not
+        reachable from another's, which RLS enforces underneath and the query states anyway."""
+        from app.db.session import tenant_session
+        from app.repositories import DocumentChunkRepository
+        from app.services.retrieval import build_tsquery
+
+        token, org_id, chatbot = await self._ready(client)
+        other = (await _create_chatbot(client, token, name="Other Bot"))["chatbot"]
+
+        async with tenant_session(uuid.UUID(org_id), readonly=True) as session:
+            repo = DocumentChunkRepository(session)
+            tsquery = await build_tsquery(session, "XR-7742B flange torque")
+            mine = await repo.search_lexical(
+                chatbot_id=uuid.UUID(chatbot["id"]), tsquery=tsquery, dimension=768, top_k=5
+            )
+            theirs = await repo.search_lexical(
+                chatbot_id=uuid.UUID(other["id"]), tsquery=tsquery, dimension=768, top_k=5
+            )
+
+        assert mine, "the term was not found in the chatbot that owns it"
+        assert theirs == []
+
+
+class TestHybridChatPath:
+    """What the toggles change, and — more importantly — what they do not."""
+
+    async def _ready(self, client, **toggles):
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [(body, _flat_vector(seed)) for body, seed in _PART_PASSAGES],
+        )
+        if toggles:
+            chatbot = await _set_caps(client, token, chatbot["id"], **toggles)
+        return token, org_id, chatbot
+
+    async def test_with_the_toggle_off_the_lexical_half_is_never_run(self, client, monkeypatch):
+        """The non-negotiable, proven by construction rather than by comparing outputs: with
+        hybrid search off, the code that would run the second query is not reached at all. A
+        test that only compared answers could pass while paying for a query nobody wanted."""
+        from app.repositories import DocumentChunkRepository
+
+        _token, _org_id, chatbot = await self._ready(client)
+
+        calls: list[str] = []
+        original = DocumentChunkRepository.search_lexical
+
+        async def _watched(self, **kwargs):
+            calls.append(kwargs.get("tsquery", ""))
+            return await original(self, **kwargs)
+
+        monkeypatch.setattr(DocumentChunkRepository, "search_lexical", _watched)
+
+        done = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question="anything at all"
+        )
+        assert done["message_id"]
+        assert calls == [], "the lexical half ran for a chatbot with hybrid search off"
+
+    async def test_escalation_is_unchanged_when_the_toggle_is_off(self, client, monkeypatch):
+        """`can_escalate` still means exactly "nothing cleared the cosine floor". Both
+        directions, because a redefinition that broke either would be the expensive kind of
+        regression — this flag is what puts the human-handoff offer in front of a visitor.
+
+        Seeded with the bag-of-words vectors the rest of the suite uses rather than the
+        deliberately-blind ones, so the vector half behaves exactly as it does in production.
+        """
+        token, org_id = await _signup(client)
+        chatbot = (await _create_chatbot(client, token))["chatbot"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [(body, _hash_embedding(body, 768)) for body, _ in _PART_PASSAGES],
+        )
+
+        echoed = await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            uuid.uuid4().hex,
+            locked=768,
+            question="Returns are accepted within 30 days of delivery",
+        )
+        assert echoed["can_escalate"] is False, "a chunk cleared the floor and a human was offered"
+
+        nothing = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question="hi there"
+        )
+        assert nothing["can_escalate"] is True
+
+    async def test_a_lexical_only_match_suppresses_the_escalation_offer(self, client, monkeypatch):
+        """The redefinition, end to end. The stub embedding puts nothing above the cosine
+        floor for this question, so today's rule would offer a human; the lexical half found
+        the passage that answers it, so the offer would be wrong."""
+        _token, _org_id, chatbot = await self._ready(client, hybrid_search_enabled=True)
+
+        # `_hash_embedding` is bag-of-words: a question sharing no words with any passage
+        # scores zero against all of them, so the cosine floor admits nothing.
+        question = "XR-7742B"
+        offered = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question=question
+        )
+        assert offered["can_escalate"] is False, (
+            "a passage was found lexically and a human was offered anyway"
+        )
+
+        unanswerable = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question="kangaroos"
+        )
+        assert unanswerable["can_escalate"] is True
+
+    async def test_an_unparseable_rerank_reply_keeps_the_fused_order(self, client, monkeypatch):
+        """Reranking improves an answer that was already good enough to serve, so nothing
+        about it is worth failing a turn over."""
+        from app.services import rag, retrieval
+
+        _token, _org_id, chatbot = await self._ready(
+            client, hybrid_search_enabled=True, hybrid_rerank_enabled=True
+        )
+
+        chat = _RecordingChat("Noted.")
+        fused_order: list[list[str]] = []
+        original = retrieval.rerank
+
+        async def _watched(provider, *, question, fused):
+            fused_order.append([f.chunk_match.chunk.content for f in fused])
+            return await original(provider, question=question, fused=fused)
+
+        monkeypatch.setattr(rag, "rerank", _watched)
+
+        done = await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            uuid.uuid4().hex,
+            locked=768,
+            chat=chat,
+            question="what torque does the XR-7742B flange need",
+        )
+
+        # `_RecordingChat` answers "Noted." to everything, including the rerank prompt, which
+        # is not a permutation — so the fused order survives and the turn completes normally.
+        assert done["message_id"]
+        assert fused_order, "reranking was never attempted"
+        prompt = _system_prompt(chat)
+        assert "XR-7742B" in prompt, "the fused order was discarded on a parse failure"
+
+    async def test_a_provider_that_fails_mid_rerank_keeps_the_fused_order(
+        self, client, monkeypatch
+    ):
+        """The other way reranking can go wrong. An unreachable model is not a reason to fail
+        a turn whose retrieval already succeeded."""
+        from app.services import rag, retrieval
+
+        _token, _org_id, chatbot = await self._ready(
+            client, hybrid_search_enabled=True, hybrid_rerank_enabled=True
+        )
+
+        outcome: dict[str, bool] = {}
+
+        async def _watched(_provider, *, question, fused):
+            class _Exploding:
+                async def stream(self, _messages):
+                    raise RuntimeError("the chat provider went away")
+                    yield ""  # pragma: no cover - makes this an async generator
+
+            result, reordered = await retrieval.rerank(_Exploding(), question=question, fused=fused)
+            outcome["reordered"] = reordered
+            outcome["same"] = result == fused
+            return result, reordered
+
+        monkeypatch.setattr(rag, "rerank", _watched)
+
+        done = await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            uuid.uuid4().hex,
+            locked=768,
+            question="what torque does the XR-7742B flange need",
+        )
+        assert done["message_id"], "a failed rerank broke the answer"
+        assert outcome == {"reordered": False, "same": True}
+
+    async def test_a_usable_rerank_reply_reorders_the_context(self, client, monkeypatch):
+        from app.services import rag, retrieval
+
+        _token, _org_id, chatbot = await self._ready(
+            client, hybrid_search_enabled=True, hybrid_rerank_enabled=True
+        )
+
+        seen: dict[str, list[str]] = {}
+        original = retrieval.rerank
+
+        async def _watched(provider, *, question, fused):
+            seen["before"] = [f.chunk_match.chunk.content[:20] for f in fused]
+            # Reverse whatever fusion produced, which is a genuine permutation.
+            reply = ",".join(str(n) for n in range(len(fused), 0, -1))
+
+            class _Reversing:
+                async def stream(self, _messages):
+                    yield reply
+
+            result, reordered = await original(_Reversing(), question=question, fused=fused)
+            seen["after"] = [f.chunk_match.chunk.content[:20] for f in result]
+            seen["reordered"] = reordered
+            return result, reordered
+
+        monkeypatch.setattr(rag, "rerank", _watched)
+
+        await _stream_chat(
+            client,
+            chatbot,
+            monkeypatch,
+            uuid.uuid4().hex,
+            locked=768,
+            question="what torque does the XR-7742B flange need",
+        )
+
+        assert seen["reordered"] is True
+        assert seen["after"] == list(reversed(seen["before"]))
+
+    async def test_hybrid_search_without_reranking_does_not_rerank(self, client, monkeypatch):
+        """The two toggles are independent, and this is the combination that proves the second
+        one is read: hybrid on, rerank off. With hybrid off the rerank branch is unreachable
+        either way, so that state cannot tell a working condition from a broken one."""
+        from app.services import rag
+
+        _token, _org_id, chatbot = await self._ready(client, hybrid_search_enabled=True)
+
+        called: list[int] = []
+
+        async def _watched(provider, *, question, fused):
+            called.append(len(fused))
+            return fused, False
+
+        monkeypatch.setattr(rag, "rerank", _watched)
+
+        done = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question="torque flange"
+        )
+        assert done["message_id"]
+        assert called == [], "reranking ran for a chatbot that did not ask for it"
+
+    async def test_reranking_alone_does_nothing_without_hybrid_search(self, client, monkeypatch):
+        """It reorders what fusion produced, so on its own it has nothing to reorder. Stated
+        as a test because the two toggles are independently settable in the API."""
+        from app.services import rag
+
+        _token, _org_id, chatbot = await self._ready(client, hybrid_rerank_enabled=True)
+
+        called: list[int] = []
+
+        async def _watched(provider, *, question, fused):
+            called.append(len(fused))
+            return fused, False
+
+        monkeypatch.setattr(rag, "rerank", _watched)
+
+        done = await _stream_chat(
+            client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768, question="torque"
+        )
+        assert done["message_id"]
+        assert called == []
+
+
+class TestSearchEndpointAuth:
+    """The first thing in this codebase to verify `secret_key_hash`."""
+
+    async def _ready(self, client):
+        token, org_id = await _signup(client)
+        created = await _create_chatbot(client, token)
+        chatbot, secret = created["chatbot"], created["secret"]["secret_key"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [(body, _flat_vector(seed)) for body, seed in _PART_PASSAGES],
+        )
+        return token, org_id, chatbot, secret
+
+    async def test_a_valid_secret_key_resolves_its_own_chatbot(self, client, monkeypatch):
+        _token, _org_id, _chatbot, secret = await self._ready(client)
+        _stub_embeddings(monkeypatch)
+
+        response = await client.post(
+            "/api/v1/search",
+            headers={"X-Chatbot-Secret": secret},
+            json={"query": "what torque does the XR-7742B flange need"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["query"] == "what torque does the XR-7742B flange need"
+
+    async def test_a_missing_or_wrong_key_is_refused_identically(self, client):
+        _token, _org_id, _chatbot, secret = await self._ready(client)
+
+        missing = await client.post("/api/v1/search", json={"query": "x"})
+        assert missing.status_code == 422, missing.text
+
+        for bad in (secret + "x", secret[:-4] + "aaaa", "pk_test_something", "nonsense"):
+            response = await client.post(
+                "/api/v1/search", headers={"X-Chatbot-Secret": bad}, json={"query": "x"}
+            )
+            assert response.status_code == 401, bad
+            # One message for unknown and for wrong. Which it was is not something an
+            # unauthenticated caller is entitled to learn.
+            assert response.json()["error"]["message"] == "Invalid chatbot secret key"
+
+    async def test_a_rotated_key_stops_working_and_the_new_one_starts(self, client, monkeypatch):
+        token, _org_id, chatbot, secret = await self._ready(client)
+        _stub_embeddings(monkeypatch)
+
+        rotated = (
+            await client.post(
+                f"/api/v1/chatbots/{chatbot['id']}/rotate-secret",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()["secret_key"]
+
+        old = await client.post(
+            "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json={"query": "torque"}
+        )
+        new = await client.post(
+            "/api/v1/search", headers={"X-Chatbot-Secret": rotated}, json={"query": "torque"}
+        )
+        assert old.status_code == 401
+        assert new.status_code == 200, new.text
+
+    async def test_one_tenants_key_cannot_reach_anothers_passages(self, client, monkeypatch):
+        """The key *is* the chatbot, so isolation here is not a scoping decision that could be
+        forgotten — but the passages another tenant seeded must still be absent."""
+        _t1, _o1, _c1, secret = await self._ready(client)
+        _t2, org2, chatbot2, _s2 = await self._ready(client)
+        await _seed_chunks(
+            org2, chatbot2["id"], [("A completely distinctive zebra passage.", _flat_vector(0.3))]
+        )
+        _stub_embeddings(monkeypatch)
+
+        response = await client.post(
+            "/api/v1/search",
+            headers={"X-Chatbot-Secret": secret},
+            json={"query": "distinctive zebra passage"},
+        )
+        assert response.status_code == 200, response.text
+        assert all("zebra" not in hit["content"] for hit in response.json()["hits"])
+
+    async def test_a_paused_chatbot_serves_no_search(self, client):
+        token, _org_id, chatbot, secret = await self._ready(client)
+        await _set_caps(client, token, chatbot["id"], status="paused")
+
+        response = await client.post(
+            "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json={"query": "torque"}
+        )
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "chatbot_unavailable"
+
+
+class TestSearchEndpoint:
+    """What it returns, and what it costs."""
+
+    async def _ready(self, client, monkeypatch):
+        token, org_id = await _signup(client)
+        created = await _create_chatbot(client, token)
+        chatbot, secret = created["chatbot"], created["secret"]["secret_key"]
+        await _configure_ai(client, token, chatbot["id"])
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [(body, _flat_vector(seed)) for body, seed in _PART_PASSAGES],
+        )
+        _stub_embeddings(monkeypatch)
+        return token, org_id, chatbot, secret
+
+    async def _search(self, client, secret: str, **payload):
+        response = await client.post(
+            "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json=payload
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    async def test_it_returns_ranked_hits_with_every_score_that_placed_them(
+        self, client, monkeypatch
+    ):
+        _token, _org_id, _chatbot, secret = await self._ready(client, monkeypatch)
+
+        body = await self._search(
+            client, secret, query="what torque does the XR-7742B flange need", top_k=3
+        )
+        hits = body["hits"]
+
+        assert hits, "nothing was returned"
+        assert "XR-7742B" in hits[0]["content"]
+        assert hits[0]["lexical_rank"] == 1
+        assert body["grounded"] is True
+        assert body["reranked"] is False
+        # Descending fused score, which is what orders the list.
+        assert [h["score"] for h in hits] == sorted((h["score"] for h in hits), reverse=True)
+        assert {"chunk_id", "document_id", "content", "metadata"} <= set(hits[0])
+
+    async def test_a_lexical_only_hit_reports_no_similarity_rather_than_zero(
+        self, client, monkeypatch
+    ):
+        """Null and 0.0 are different claims: one says the vector half never ranked this
+        passage, the other says it ranked it and scored it at zero."""
+        _token, org_id, chatbot, secret = await self._ready(client, monkeypatch)
+        query = "XR-7742B flange torque"
+        # Twenty-five fillers carrying the query's own vector, so they take the whole vector
+        # candidate list and the two passages that actually mention the part are reachable
+        # only through the text index.
+        await _seed_chunks(
+            org_id,
+            chatbot["id"],
+            [
+                (
+                    f"Filler passage number {n} about packaging and delivery.",
+                    _hash_embedding(query, 768),
+                )
+                for n in range(25)
+            ],
+        )
+
+        body = await self._search(client, secret, query=query, top_k=10)
+        lexical_only = [h for h in body["hits"] if h["vector_rank"] is None]
+
+        assert lexical_only, "the fixture produced no lexical-only hit"
+        assert all(h["similarity"] is None for h in lexical_only)
+        assert all(h["lexical_score"] is not None for h in lexical_only)
+
+    async def test_it_charges_one_retrieval_call(self, client, monkeypatch):
+        """Iteration 16's counter, from a second call site. `consume` was written generic for
+        exactly this and needed no change."""
+        _token, org_id, chatbot, secret = await self._ready(client, monkeypatch)
+        assert await _usage_row(org_id, chatbot["id"]) is None
+
+        await self._search(client, secret, query="torque")
+        assert await _usage_row(org_id, chatbot["id"]) == (0, 1)
+
+        await self._search(client, secret, query="torque")
+        assert await _usage_row(org_id, chatbot["id"]) == (0, 2)
+
+    async def test_it_refuses_once_the_monthly_cap_is_spent(self, client, monkeypatch):
+        token, _org_id, chatbot, secret = await self._ready(client, monkeypatch)
+        await _set_caps(client, token, chatbot["id"], monthly_retrieval_call_cap=1)
+
+        await self._search(client, secret, query="torque")
+        response = await client.post(
+            "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json={"query": "torque"}
+        )
+
+        assert response.status_code == 429, response.text
+        assert response.json()["error"]["code"] == "usage_cap_exceeded"
+
+    async def test_it_has_its_own_rate_limit_bucket(self, client, monkeypatch, rate_limited):
+        """Its own, so a backend batch-querying search cannot throttle the widget answering
+        live visitors on the same chatbot."""
+        from app.core.config import settings
+
+        _token, _org_id, chatbot, secret = await self._ready(client, monkeypatch)
+        monkeypatch.setattr(settings.rate_limit, "search_capacity", 2)
+        monkeypatch.setattr(settings.rate_limit, "search_refill_per_second", 0.0001)
+
+        codes = []
+        for _ in range(4):
+            response = await client.post(
+                "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json={"query": "torque"}
+            )
+            codes.append(response.status_code)
+
+        assert codes[:2] == [200, 200]
+        assert 429 in codes[2:]
+
+        # The chat path is untouched by that bucket being empty.
+        done = await _stream_chat(client, chatbot, monkeypatch, uuid.uuid4().hex, locked=768)
+        assert done["message_id"]
+
+    async def test_nothing_is_written_to_the_transcript(self, client, monkeypatch):
+        """A raw retrieval query, not a chat turn. No conversation, no message, no answer."""
+        token, _org_id, chatbot, secret = await self._ready(client, monkeypatch)
+
+        await self._search(client, secret, query="what torque does the XR-7742B flange need")
+
+        listed = await client.get(
+            f"/api/v1/chatbots/{chatbot['id']}/conversations",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert listed.json()["items"] == []
+
+    async def test_a_chatbot_with_nothing_indexed_answers_empty(self, client, monkeypatch):
+        token, _org_id = await _signup(client)
+        created = await _create_chatbot(client, token)
+        await _configure_ai(client, token, created["chatbot"]["id"])
+        _stub_embeddings(monkeypatch)
+
+        body = await self._search(client, created["secret"]["secret_key"], query="anything")
+        assert body == {"query": "anything", "hits": [], "grounded": False, "reranked": False}
+
+    async def test_rerank_is_off_unless_asked_for(self, client, monkeypatch):
+        from app.services import search as search_service
+
+        _token, _org_id, _chatbot, secret = await self._ready(client, monkeypatch)
+        called: list[str] = []
+
+        async def _watched(provider, *, question, fused):
+            called.append(question)
+            return fused, True
+
+        monkeypatch.setattr(search_service, "rerank", _watched)
+
+        assert (await self._search(client, secret, query="torque"))["reranked"] is False
+        assert called == []
+
+        assert (await self._search(client, secret, query="torque", rerank=True))["reranked"] is True
+        assert called == ["torque"]
+
+    async def test_a_chatbot_without_a_chat_provider_still_searches(self, client, monkeypatch):
+        """Reranking needs a chat model; retrieval does not. A request that asked for
+        reranking and could not have it gets its results with `reranked: false` rather than an
+        error about a provider it did not need."""
+        from app.services.ai import factory
+
+        _token, _org_id, _chatbot, secret = await self._ready(client, monkeypatch)
+
+        async def _broken(*_args, **_kwargs):
+            raise RuntimeError("no chat provider configured")
+
+        monkeypatch.setattr(factory, "get_chat_provider", _broken)
+
+        body = await self._search(client, secret, query="XR-7742B", rerank=True)
+        assert body["hits"], "a missing chat provider cost the search its results"
+        assert body["reranked"] is False
+
+    async def test_the_request_is_validated(self, client, monkeypatch):
+        _token, _org_id, _chatbot, secret = await self._ready(client, monkeypatch)
+
+        for payload in ({"query": ""}, {"query": "x", "top_k": 0}, {"query": "x", "top_k": 999}):
+            response = await client.post(
+                "/api/v1/search", headers={"X-Chatbot-Secret": secret}, json=payload
+            )
+            assert response.status_code == 422, payload
+
+
 @pytest.mark.skipif(
     _OLLAMA is None,
     reason=f"no Ollama with both a chat and an embedding model at {OLLAMA_URL}",
