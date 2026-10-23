@@ -2,7 +2,7 @@
 # Kept separate from the API image so a traffic spike on tenant sites never shares compute
 # with dashboards or the ingestion pipeline.
 
-FROM node:22-alpine AS build
+FROM node:26.12.1-alpine AS build
 WORKDIR /build
 COPY frontend/apps/widget/package.json ./package.json
 COPY frontend/apps/widget/build.mjs ./build.mjs

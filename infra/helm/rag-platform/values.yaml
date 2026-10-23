@@ -172,7 +172,7 @@ beat:
 dashboard:
   replicaCount: 1
   port: 3000
-  # `node`, from the node:24-alpine base.
+  # `node`, from the node:26.12.1-alpine base.
   podSecurityContext:
     runAsUser: 1000
     runAsGroup: 1000

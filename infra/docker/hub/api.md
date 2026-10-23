@@ -90,7 +90,7 @@ The full variable list is in the
 - **Port:** 8000
 - **User:** non-root, UID/GID `1001`
 - **Health:** `GET /health/live` (process up), `GET /health/ready` (dependencies reachable)
-- **Base:** `python:3.14-slim-bookworm`
+- **Base:** `python:3.15-slim-trixie`
 
 AI providers are **not** configured here. Each tenant chooses Azure OpenAI, Bedrock, Anthropic
 or Ollama in the dashboard, and those credentials are stored encrypted in the database.

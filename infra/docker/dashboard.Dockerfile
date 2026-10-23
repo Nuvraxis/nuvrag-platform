@@ -1,13 +1,15 @@
 # Tenant dashboard (Next.js). Built from the Turborepo root so the workspace packages it
 # depends on resolve the same way they do locally.
 
-FROM node:24-alpine AS base
+FROM node:26.12.1-alpine AS base
 
 ENV PNPM_HOME=/pnpm \
     PATH=/pnpm:$PATH \
     NEXT_TELEMETRY_DISABLED=1
 
-RUN corepack enable
+# Node 25+ no longer ships corepack, so pnpm comes from npm. Keep in step with the
+# `packageManager` field in frontend/package.json.
+RUN npm install -g pnpm@11.1.1
 
 
 FROM base AS deps
