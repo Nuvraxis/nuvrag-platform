@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/github/license/Nuvraxis/nuvrag-platform)](https://github.com/Nuvraxis/nuvrag-platform/blob/main/LICENSE.md)
 [![Docker Hub](https://img.shields.io/docker/v/nuvraxis/rag-chatbot-api?label=docker&sort=semver)](https://hub.docker.com/r/nuvraxis/rag-chatbot-api)
 [![Docker Pulls](https://img.shields.io/docker/pulls/nuvraxis/rag-chatbot-api)](https://hub.docker.com/r/nuvraxis/rag-chatbot-api)
-![Python](https://img.shields.io/badge/python-3.14-blue)
+![Python](https://img.shields.io/badge/python-3.15-blue)
 
 Multi-tenant RAG platform: organisations create chatbots, upload documents, and embed a chat
 widget on their own sites. FastAPI serves the API, a Celery worker handles ingestion,

@@ -210,7 +210,7 @@ a user an image names rather than numbers is not root — `USER app` is refused 
 | Component | UID | From |
 |---|---|---|
 | api, worker, beat, migrate | 1001 | `app`, created in `api.Dockerfile` |
-| dashboard | 1000 | `node`, in the `node:24-alpine` base |
+| dashboard | 1000 | `node`, in the `node:26.12.1-alpine` base |
 | widget | 101 | `nginx`, in `nginxinc/nginx-unprivileged` |
 
 The Dockerfiles now write these numerically too, so a freshly built image needs no help from

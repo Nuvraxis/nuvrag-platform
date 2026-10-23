@@ -1,7 +1,7 @@
 # Shared image for the API and the ingestion worker. Same code, different entrypoint — which
 # is what keeps their dependency sets from drifting apart.
 
-FROM python:3.14-slim-bookworm AS base
+FROM python:3.15-slim-trixie AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -20,6 +20,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 
 FROM base AS deps
 WORKDIR /app
+# A compiler for the few dependencies with no wheel for this Python yet (zstandard). It stays
+# in this stage: the runtime image copies only the finished venv.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 # Dependencies resolve from the lockfile alone, so this layer is cached until the lock changes.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project

@@ -46,7 +46,7 @@ Two consequences worth knowing:
 - **User:** non-root, UID/GID `1000`
 - **Build:** Next.js `output: standalone`, so the runtime image carries only the traced
   dependencies rather than the workspace
-- **Base:** `node:24-alpine`
+- **Base:** `node:26.12.1-alpine`
 
 ## Running it
 
